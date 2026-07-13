@@ -6,3 +6,6 @@ __pycache__/
 *.db
 .pytest_cache/
 logs/
+evals/results/
+evals/eval_lifeops.db
+backups/

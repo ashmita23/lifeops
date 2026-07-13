@@ -39,10 +39,20 @@ _mcp_tools_cache: list[dict] | None = None
 def _server_params() -> StdioServerParameters | None:
     if not settings.google_oauth_credentials_path:
         return None
+    env = {"GOOGLE_OAUTH_CREDENTIALS": settings.google_oauth_credentials_path}
+    # Without this, the MCP server caches OAuth tokens under its own default
+    # config dir (e.g. ~/.config/google-calendar-mcp on Linux) - fine
+    # locally, but on an ephemeral host that directory doesn't persist
+    # across redeploys and there's no browser to redo the interactive OAuth
+    # consent flow headlessly. Pointing this at the same persistent volume
+    # used for DATABASE_PATH lets a token generated once (locally) keep
+    # working after every redeploy.
+    if settings.google_calendar_mcp_token_path:
+        env["GOOGLE_CALENDAR_MCP_TOKEN_PATH"] = settings.google_calendar_mcp_token_path
     return StdioServerParameters(
         command="npx",
         args=["-y", "@cocal/google-calendar-mcp"],
-        env={"GOOGLE_OAUTH_CREDENTIALS": settings.google_oauth_credentials_path},
+        env=env,
     )
 
 

@@ -61,6 +61,12 @@ from app.tools.reminders import (
 
 MAX_TOOL_ITERATIONS = 5
 
+# Cap on how many messages (excluding the system message) a conversation
+# keeps - unbounded growth means more tokens sent per call and more DB
+# read/write on every turn for a long-running conversation. No
+# summarization, just a bound.
+MAX_HISTORY_MESSAGES = 40
+
 # Conversation history and pending delete-confirmations are persisted in
 # SQLite (app.session_store) so they survive a process restart - see
 # app/db.py's conversations/pending_confirmations tables.
@@ -73,6 +79,40 @@ _LOCAL_CALENDAR_TOOL_NAMES = {
     "list_calendar_events",
     "update_calendar_event",
     "delete_calendar_event",
+}
+
+CONFIRM_TOOL_NAME = "respond_to_pending_confirmation"
+
+# The only way a destructive action ever actually executes. Deliberately
+# never asks the model to regenerate/re-supply the original arguments -
+# confirming just replays the EXACT call that was stored when the action
+# first paused (see PENDING_CONFIRMATIONS handling below), so there's
+# nothing for drifting/re-generated arguments to mismatch against.
+_CONFIRM_TOOL = {
+    "type": "function",
+    "function": {
+        "name": CONFIRM_TOOL_NAME,
+        "description": (
+            "Respond to a pending destructive action that's awaiting the user's "
+            "confirmation (you'll see your own previous message asking them to "
+            "confirm). Call this instead of calling the original delete/remove/"
+            "cancel tool again yourself - this executes the exact original "
+            "pending action directly, so its arguments never need to be "
+            "reconstructed or guessed a second time."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "true if the user's latest message confirms proceeding, false if they decline",
+                },
+            },
+            "required": ["confirmed"],
+            "additionalProperties": False,
+        },
+    },
 }
 
 # OpenAI's strict structured-outputs mode requires every property to be
@@ -404,8 +444,17 @@ def _execute_local_tool(tool_name: str, args: dict, input_text: str) -> dict:
     return TOOL_DISPATCH[tool_name](args, input_text)
 
 
+_DESTRUCTIVE_KEYWORDS = ("delete", "remove", "cancel", "trash")
+
+
 def _is_destructive_tool(name: str) -> bool:
-    return "delete" in name.lower()
+    # Name-based heuristic - covers our own tools (all "delete_*") and the
+    # current MCP server's "delete-event". Broadened beyond just "delete"
+    # since we don't control MCP tool naming and a future server version
+    # could use a different verb (e.g. "remove-event", "cancel-event")
+    # without us noticing the safety gate silently stopped applying.
+    lowered = name.lower()
+    return any(keyword in lowered for keyword in _DESTRUCTIVE_KEYWORDS)
 
 
 def _record_status(record: dict) -> tuple[str, str | None]:
@@ -417,38 +466,85 @@ def _record_status(record: dict) -> tuple[str, str | None]:
     return "success", None
 
 
-def _assistant_tool_call_message(call, tool_name: str, raw_args: str) -> dict:
-    return {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            {"id": call.id, "type": "function", "function": {"name": tool_name, "arguments": raw_args}}
-        ],
-    }
-
-
 _FALLBACK_MESSAGES = {
     "confirm": "Please confirm: should I go ahead with that?",
     "repeat": "I tried the same action twice with identical arguments and stopped to avoid looping.",
     "cap": "I've made several changes this turn and stopped at the per-turn action limit.",
 }
 
+_DECLINE_MESSAGE = "Okay, I won't go ahead with that."
+
+# Deterministic backstop for the "confirm" synthesis call: if the model's
+# phrasing still claims completion despite _CONFIRM_CONTEXT_NOTE, it's
+# discarded for the canned fallback instead. This does NOT depend on the
+# note working - it's a second, independent guardrail against the synthesis
+# step narrating a false "done" for an action that hasn't executed yet.
+_FALSE_COMPLETION_MARKERS = (
+    "deleted", "removed", "cancelled", "canceled", "done", "completed", "successfully", "all set",
+)
+
+_CONFIRM_CONTEXT_NOTE = {
+    "role": "system",
+    "content": (
+        "Reminder: the destructive action you just proposed has NOT executed yet - it is only "
+        "awaiting the user's yes/no confirmation. Do not say it is done, deleted, removed, "
+        "cancelled, or completed. Only ask the user to confirm."
+    ),
+}
+
+
+def _trim_history(messages: list[dict]) -> list[dict]:
+    """Keeps the system message plus at most MAX_HISTORY_MESSAGES more,
+    never cutting into the middle of an assistant-tool_calls/tool sequence
+    (which would leave a "tool" message whose tool_call_id was never
+    declared - API-invalid). Only starts the truncated history at a "user"
+    message boundary."""
+    if len(messages) <= MAX_HISTORY_MESSAGES + 1:  # +1 for the system message
+        return messages
+
+    system_message = messages[0]
+    rest = messages[1:]
+    cutoff = len(rest) - MAX_HISTORY_MESSAGES
+    while cutoff < len(rest) and rest[cutoff].get("role") != "user":
+        cutoff += 1
+    return [system_message] + rest[cutoff:]
+
 
 def _final_text(messages: list[dict], tools: list[dict], reason: str) -> str:
     """Makes one text-only (tool_choice='none') call so the model can phrase
-    a natural confirmation/summary, with a canned fallback if unavailable."""
+    a natural confirmation/summary, with a canned fallback if unavailable.
+
+    reason == "confirm" means nothing has executed yet - only a confirmation
+    question is being asked. _CONFIRM_CONTEXT_NOTE is appended ephemerally
+    (never persisted to real history) to steer the model away from implying
+    completion. As an independent, deterministic backstop that doesn't rely
+    on the note actually working, the resulting text is also scanned for
+    false-completion language and discarded for the canned fallback if found -
+    this is what protects against the synthesis step lying about success
+    even if some unrelated bug produces a weird tool result later."""
+    call_messages = messages if reason != "confirm" else messages + [_CONFIRM_CONTEXT_NOTE]
+
     try:
-        synthesis_message = call_llm_with_tools(messages, tools, tool_choice="none")
+        synthesis_message = call_llm_with_tools(call_messages, tools, tool_choice="none")
         final_text = synthesis_message.content or _FALLBACK_MESSAGES.get(reason, "Done.")
     except LLMUnavailableError:
         final_text = _FALLBACK_MESSAGES.get(reason, "Done.")
+
+    if reason == "confirm" and any(marker in final_text.lower() for marker in _FALSE_COMPLETION_MARKERS):
+        final_text = _FALLBACK_MESSAGES["confirm"]
+
     messages.append({"role": "assistant", "content": final_text})
     return final_text
 
 
-def _build_tools() -> tuple[list[dict], bool]:
+def _build_tools(include_confirm_tool: bool) -> tuple[list[dict], bool]:
     """Merges local tools with whatever the Google Calendar MCP server
-    exposes (if connected). Returns (tools, mcp_active)."""
+    exposes (if connected). Returns (tools, mcp_active).
+
+    include_confirm_tool: only offer CONFIRM_TOOL_NAME when there's an
+    actual pending confirmation for this session - otherwise it's a
+    meaningless option that could confuse the model into calling it
+    without cause."""
     mcp_tools = mcp_client.get_mcp_tools()
     mcp_active = bool(mcp_tools)
 
@@ -458,7 +554,19 @@ def _build_tools() -> tuple[list[dict], bool]:
             tool for tool in _LOCAL_TOOLS if tool["function"]["name"] not in _LOCAL_CALENDAR_TOOL_NAMES
         ]
 
-    return local_tools + mcp_tools, mcp_active
+    tools = local_tools + mcp_tools
+
+    if include_confirm_tool:
+        # While a destructive action is pending confirmation, hide ALL
+        # destructive tools from the model entirely for this turn - the
+        # only way to actually execute one is via the confirm tool below,
+        # which replays the exact original pending call. This is a hard,
+        # code-enforced guarantee, not just a prompt instruction the model
+        # could ignore.
+        tools = [t for t in tools if not _is_destructive_tool(t["function"]["name"])]
+        tools = tools + [_CONFIRM_TOOL]
+
+    return tools, mcp_active
 
 
 def _system_prompt(timezone: str, mcp_active: bool) -> str:
@@ -492,7 +600,13 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
         "id (e.g. 'delete my dentist reminder', 'mark the tax thing done'), call the "
         "matching list tool first to find its id before acting on it. Always confirm "
         "with the user before deleting anything, since deletion is irreversible - "
-        "expect a delete request to pause and ask for confirmation before it executes.\n\n"
+        "expect a delete request to pause and ask for confirmation before it executes. "
+        "When you see your own previous message asking to confirm a pending destructive "
+        f"action, and the user's new message responds to it, call {CONFIRM_TOOL_NAME} "
+        "with confirmed=true or confirmed=false - do NOT call the original delete/"
+        "remove/cancel tool again yourself; that tool isn't available right now for "
+        "exactly this reason, and respond_to_pending_confirmation executes the exact "
+        "original pending action directly if confirmed.\n\n"
         "Reminders and calendar events are two distinct, separate things - a reminder is "
         "a private to-do tracked only in this app (title + due date), a calendar event is "
         "a real, shareable, time-blocked entry on the user's actual calendar. Pick exactly "
@@ -560,7 +674,12 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
             actions=[],
         )
 
-    tools, mcp_active = _build_tools()
+    # Snapshot (and clear) any pending delete-confirmation for this session.
+    # Rule 8: if this turn doesn't re-request confirmation, the stale
+    # pending state is gone - it never lingers past one follow-up turn.
+    pending_before = session_store.pop_pending_confirmation(session_id)
+
+    tools, mcp_active = _build_tools(include_confirm_tool=pending_before is not None)
 
     messages = session_store.get_session_messages(session_id)
     if messages is None:
@@ -569,20 +688,36 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
     messages.append({"role": "user", "content": input_text})
 
     def _finish(result: AgentTurnResult) -> AgentTurnResult:
-        session_store.save_session_messages(session_id, messages)
+        session_store.save_session_messages(session_id, _trim_history(messages))
         return result
-
-    # Snapshot (and clear) any pending delete-confirmation for this session.
-    # Rule 8: if this turn doesn't re-request the exact same action, the
-    # stale pending state is gone - it never lingers past one follow-up turn.
-    pending_before = session_store.pop_pending_confirmation(session_id)
 
     actions: list[dict] = []
     seen_calls: set[tuple] = set()
     last_tool_name: str | None = None
     last_record: dict | None = None
 
-    for _ in range(MAX_TOOL_ITERATIONS):
+    def _append_assistant_tool_calls(tool_calls) -> None:
+        # One assistant message carrying ALL tool calls from this response,
+        # matching what the API actually returned - not one message per
+        # call. Every id here needs a matching "tool" result message before
+        # the next LLM call, real or a synthetic "not executed" placeholder.
+        messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {"name": c.function.name, "arguments": c.function.arguments or "{}"},
+                }
+                for c in tool_calls
+            ],
+        })
+
+    def _append_tool_result(call_id: str, content: dict) -> None:
+        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(content)})
+
+    while len(actions) < MAX_TOOL_ITERATIONS:
         try:
             response_message = call_llm_with_tools(messages, tools)
         except LLMUnavailableError:
@@ -608,18 +743,151 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
                 actions=actions,
             ))
 
-        call = tool_calls[0]
-        tool_name = call.function.name
-        raw_args = call.function.arguments or "{}"
-        try:
-            args = json.loads(raw_args)
-        except json.JSONDecodeError:
-            args = {}
+        # The model may batch multiple actions into one response (confirmed
+        # live: responses with 2-4 tool calls at once). Process all of them
+        # in this same round-trip instead of one-per-LLM-call.
+        _append_assistant_tool_calls(tool_calls)
 
-        # Rule 9: same (tool, args) repeating this turn means the model is
-        # stuck - stop early rather than burning the rest of the cap.
-        call_signature = (tool_name, json.dumps(args, sort_keys=True))
-        if call_signature in seen_calls:
+        stop_reason: str | None = None
+        stop_tool_name: str | None = None
+
+        for call in tool_calls:
+            tool_name = call.function.name
+            raw_args = call.function.arguments or "{}"
+
+            if stop_reason is not None:
+                # Already decided to stop this turn - every remaining call
+                # still needs a result so the message history stays valid,
+                # without actually executing anything further.
+                _append_tool_result(call.id, {"status": "not_executed", "reason": stop_reason})
+                continue
+
+            if len(actions) >= MAX_TOOL_ITERATIONS:
+                _append_tool_result(call.id, {"status": "not_executed", "reason": "cap_reached"})
+                stop_reason = "cap"
+                continue
+
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+
+            # Rule 9: same (tool, args) repeating this turn means the model
+            # is stuck - stop rather than burning the rest of the cap.
+            call_signature = (tool_name, json.dumps(args, sort_keys=True))
+            if call_signature in seen_calls:
+                _append_tool_result(call.id, {"status": "not_executed", "reason": "repeat_detected"})
+                stop_reason = "repeat"
+                continue
+            seen_calls.add(call_signature)
+
+            # The confirm tool is a meta-tool, not a normal dispatchable
+            # resource action - handle it before the unknown-tool check
+            # (it's never in TOOL_DISPATCH or the MCP tool list) and before
+            # the destructive-tool gate (it's how that gate gets satisfied).
+            if tool_name == CONFIRM_TOOL_NAME:
+                confirmed = bool(args.get("confirmed"))
+                _append_tool_result(call.id, {"status": "confirmed" if confirmed else "declined"})
+
+                if not confirmed:
+                    return _finish(AgentTurnResult(
+                        session_id=session_id,
+                        done=False,
+                        message=_DECLINE_MESSAGE,
+                        stored_record=None,
+                        tool_called=None,
+                        actions=actions,
+                    ))
+
+                if pending_before is None:
+                    # Shouldn't happen (the tool is only offered when a
+                    # pending confirmation exists), but don't crash if it does.
+                    continue
+
+                # Execute the EXACT action stored when it first paused - never
+                # whatever arguments this call itself carries (it only has
+                # `confirmed`). There is nothing here to regenerate or
+                # compare, so nothing can drift or mismatch.
+                pending_tool_name = pending_before["tool"]
+                pending_args = pending_before["arguments"]
+                if pending_tool_name in TOOL_DISPATCH:
+                    record = _execute_local_tool(pending_tool_name, pending_args, input_text)
+                else:
+                    record = mcp_client.call_mcp_tool(pending_tool_name, pending_args)
+
+                status, error = _record_status(record)
+                actions.append(
+                    {"tool": pending_tool_name, "arguments": pending_args, "status": status, "result": record, "error": error}
+                )
+                last_tool_name, last_record = pending_tool_name, record
+                pending_before = None  # consumed - a later call in this batch can't reuse it
+                continue
+
+            handler = TOOL_DISPATCH.get(tool_name)
+            is_known_local = handler is not None
+            is_known_mcp = not is_known_local and mcp_client.is_mcp_tool(tool_name)
+
+            if not is_known_local and not is_known_mcp:
+                actions.append(
+                    {"tool": tool_name, "arguments": args, "status": "error", "result": None, "error": "unknown tool"}
+                )
+                _append_tool_result(call.id, {"error": f"Unknown tool '{tool_name}'"})
+                stop_reason = "unknown"
+                stop_tool_name = tool_name
+                continue
+
+            # Rules 5-8: destructive tools always pause for an explicit human
+            # confirmation turn before they execute - no exceptions here.
+            # The ONLY execution path for a destructive tool is via
+            # CONFIRM_TOOL_NAME above, which replays the stored call exactly -
+            # this branch never re-checks "was this already confirmed" by
+            # comparing arguments, since there's nothing left to compare.
+            if _is_destructive_tool(tool_name):
+                session_store.set_pending_confirmation(session_id, tool_name, args)
+                _append_tool_result(call.id, {"status": "awaiting_confirmation"})
+                stop_reason = "confirm"
+                stop_tool_name = tool_name
+                continue
+
+            if is_known_local:
+                record = _execute_local_tool(tool_name, args, input_text)
+            else:
+                record = mcp_client.call_mcp_tool(tool_name, args)
+
+            status, error = _record_status(record)
+            _append_tool_result(call.id, record)
+
+            actions.append({"tool": tool_name, "arguments": args, "status": status, "result": record, "error": error})
+            last_tool_name, last_record = tool_name, record
+
+            # Rule 7 (revised): only *proposing* an unconfirmed destructive
+            # call pauses the turn (handled above). A confirmed execution
+            # (via CONFIRM_TOOL_NAME) falls through like any other tool call -
+            # processing continues so the model can pick back up the rest
+            # of a multi-part request in this same turn.
+
+        if stop_reason == "unknown":
+            return _finish(AgentTurnResult(
+                session_id=session_id,
+                done=False,
+                message=f"Model tried to call unknown tool '{stop_tool_name}'.",
+                stored_record=None,
+                tool_called=stop_tool_name,
+                actions=actions,
+            ))
+
+        if stop_reason == "confirm":
+            confirmation_text = _final_text(messages, tools, reason="confirm")
+            return _finish(AgentTurnResult(
+                session_id=session_id,
+                done=False,
+                message=confirmation_text,
+                stored_record=None,
+                tool_called=stop_tool_name,
+                actions=actions,
+            ))
+
+        if stop_reason == "repeat":
             final_text = _final_text(messages, tools, reason="repeat")
             return _finish(AgentTurnResult(
                 session_id=session_id,
@@ -629,71 +897,23 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
                 tool_called=last_tool_name,
                 actions=actions,
             ))
-        seen_calls.add(call_signature)
 
-        handler = TOOL_DISPATCH.get(tool_name)
-        is_known_local = handler is not None
-        is_known_mcp = not is_known_local and mcp_client.is_mcp_tool(tool_name)
-
-        if not is_known_local and not is_known_mcp:
-            actions.append(
-                {"tool": tool_name, "arguments": args, "status": "error", "result": None, "error": "unknown tool"}
-            )
+        if stop_reason == "cap":
+            final_text = _final_text(messages, tools, reason="cap")
             return _finish(AgentTurnResult(
                 session_id=session_id,
-                done=False,
-                message=f"Model tried to call unknown tool '{tool_name}'.",
-                stored_record=None,
-                tool_called=tool_name,
+                done=True,
+                message=final_text,
+                stored_record=last_record,
+                tool_called=last_tool_name,
                 actions=actions,
             ))
 
-        # Rules 5-8: destructive tools always require an explicit human
-        # confirmation turn before they actually execute.
-        if _is_destructive_tool(tool_name):
-            already_confirmed = (
-                pending_before is not None
-                and pending_before["tool"] == tool_name
-                and pending_before["arguments"] == args
-            )
-            if not already_confirmed:
-                session_store.set_pending_confirmation(session_id, tool_name, args)
-                messages.append(_assistant_tool_call_message(call, tool_name, raw_args))
-                messages.append(
-                    {"role": "tool", "tool_call_id": call.id, "content": json.dumps({"status": "awaiting_confirmation"})}
-                )
-                confirmation_text = _final_text(messages, tools, reason="confirm")
-                return _finish(AgentTurnResult(
-                    session_id=session_id,
-                    done=False,
-                    message=confirmation_text,
-                    stored_record=None,
-                    tool_called=tool_name,
-                    actions=actions,
-                ))
-            # Already confirmed on a prior turn - fall through and execute.
+        # No stop reason - the whole batch executed cleanly, loop back for
+        # the model's next decision (or its final answer).
 
-        if is_known_local:
-            record = _execute_local_tool(tool_name, args, input_text)
-        else:
-            record = mcp_client.call_mcp_tool(tool_name, args)
-
-        status, error = _record_status(record)
-
-        messages.append(_assistant_tool_call_message(call, tool_name, raw_args))
-        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(record)})
-
-        actions.append({"tool": tool_name, "arguments": args, "status": status, "result": record, "error": error})
-        last_tool_name, last_record = tool_name, record
-
-        # Rule 7 (revised): only *proposing* an unconfirmed destructive call
-        # pauses the turn (handled above). Once confirmed and executed, it
-        # falls through here like any other tool call - the loop continues
-        # so the model can pick back up the rest of a multi-part request
-        # ("...and also remind me to call back next week") in this same
-        # turn, instead of requiring a manual follow-up nudge.
-
-    # Rule 10: cap hit - force one final summary of everything done.
+    # Rule 10: cap hit without an explicit stop_reason=="cap" return above
+    # (defensive fallback - normally that path already returns first).
     final_text = _final_text(messages, tools, reason="cap")
     return _finish(AgentTurnResult(
         session_id=session_id,

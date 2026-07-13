@@ -1,0 +1,13 @@
+# Railway config-as-code. Volumes themselves (the persistent disk backing
+# DATABASE_PATH) can't be fully declared here - Railway ties a volume to a
+# specific service via the dashboard or `railway volume add`, not this file -
+# see the "Persistence on Railway" section in README.md for the one-time
+# setup steps. This file just pins the deploy behavior so it doesn't depend
+# on dashboard settings alone.
+
+[deploy]
+startCommand = "python space_app.py"
+healthcheckPath = "/"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

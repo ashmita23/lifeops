@@ -14,6 +14,22 @@ class Settings:
     database_path: str = os.getenv("DATABASE_PATH", "lifeops.db")
     default_timezone: str = os.getenv("DEFAULT_TIMEZONE", "America/Chicago")
     google_oauth_credentials_path: str | None = os.getenv("GOOGLE_OAUTH_CREDENTIALS_PATH") or None
+    # Optional override for where the Calendar MCP server reads/writes its
+    # cached OAuth token - see app/mcp_client.py for why this matters on
+    # ephemeral hosts.
+    google_calendar_mcp_token_path: str | None = os.getenv("GOOGLE_CALENDAR_MCP_TOKEN_PATH") or None
+
+    # Shared-password gate for the publicly reachable Gradio UI (see
+    # frontend/gradio_app.py). Both must be set for auth to actually apply -
+    # deliberately no silent bypass if only one is configured.
+    gradio_auth_user: str | None = os.getenv("GRADIO_AUTH_USER") or None
+    gradio_auth_pass: str | None = os.getenv("GRADIO_AUTH_PASS") or None
+
+    @property
+    def gradio_auth(self) -> tuple[str, str] | None:
+        if self.gradio_auth_user and self.gradio_auth_pass:
+            return (self.gradio_auth_user, self.gradio_auth_pass)
+        return None
 
     # langfuse's SDK auto-reads LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY/LANGFUSE_HOST
     # from the environment itself; these are only kept here so we can log

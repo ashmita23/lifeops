@@ -52,16 +52,20 @@ def call_llm_with_tools(messages: list[dict], tools: list[dict], tool_choice: st
     message object, so callers can inspect .tool_calls or .content directly.
 
     tool_choice="none" forces a plain-text response with no further tool
-    calls - used for the synthesis step after a tool has already run."""
+    calls - used for the synthesis/confirmation/repeat/cap-summary steps
+    after a tool has already run. In that case, the ~13-22 tool schemas
+    are omitted from the request entirely rather than sent-but-unusable -
+    tool_choice="none" already makes it impossible for the model to call
+    anything, so there's no reason to pay the prompt-size cost of
+    describing tools it's forbidden from using."""
     if settings.demo_mode:
         raise LLMUnavailableError("No OPENAI_API_KEY configured; running in demo mode")
 
     client = _get_client()
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=messages,
-        tools=tools,
-        tool_choice=tool_choice,
-        temperature=0,
-    )
+    kwargs = {"model": settings.openai_model, "messages": messages, "temperature": 0}
+    if tool_choice != "none":
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice
+
+    response = client.chat.completions.create(**kwargs)
     return response.choices[0].message

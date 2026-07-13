@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit/integration test suite
+        # Deliberately does NOT run evals/run_evals.py here - that suite
+        # hits the real OpenAI/MCP APIs and costs money per run, so it stays
+        # a manual/on-demand check rather than something every push pays for.
+        run: pytest -q

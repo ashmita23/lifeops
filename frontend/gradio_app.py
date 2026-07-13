@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import mcp_client
 from app.agent import run_agent_turn
+from app.config import settings
 from app.db import init_db
 from app.llm_client import LLMUnavailableError
 from app.tracing import init_tracing
@@ -22,9 +23,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger(__name__)
 
 # One reused executor for the process lifetime - trace export runs here so
-# it never blocks the chat reply. Small pool since this is a background
-# side-task, not a hot path.
-_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trace-export")
+# it never blocks the chat reply. Each export can hold a worker for up to
+# ~30s (the completeness-polling budget in app/trace_export.py), so a small
+# pool means rapid-fire messages queue up behind earlier exports - 4 gives
+# real headroom without being wasteful for a background side-task.
+_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="trace-export")
 
 
 def _export_trace_background(trace_id: str | None, expected_latency_seconds: float | None = None) -> None:
@@ -133,6 +136,13 @@ def main() -> None:
     init_db()
     mcp_client.start()
 
+    if settings.gradio_auth is None:
+        logger.warning(
+            "GRADIO_AUTH_USER/GRADIO_AUTH_PASS not set - the app is running with NO login "
+            "gate and is fully open to anyone who can reach the URL. Set both env vars to "
+            "require a shared password."
+        )
+
     with gr.Blocks(title="LifeOps Agent") as demo:
         gr.Markdown("# ✨ LifeOps Agent", elem_id="chat-title")
         gr.Markdown(
@@ -166,6 +176,7 @@ def main() -> None:
         css=_CUSTOM_CSS,
         server_name=os.environ.get("SERVER_NAME", "0.0.0.0"),
         server_port=int(os.environ.get("PORT", 7860)),
+        auth=settings.gradio_auth,
     )
 
 

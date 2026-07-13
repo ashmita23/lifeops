@@ -76,6 +76,10 @@ Fill in `.env`:
 - `GOOGLE_OAUTH_CREDENTIALS_PATH` - optional, enables real Google Calendar.
 - `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_HOST` - optional,
   enables tracing + trace export.
+- `GRADIO_AUTH_USER`/`GRADIO_AUTH_PASS` - **strongly recommended for any
+  deployment reachable outside your own machine.** If either is unset, the
+  Gradio UI has no login at all and anyone with the URL can use it (and
+  spend your OpenAI credits) - a warning is logged at startup as a reminder.
 
 ## Run the Gradio agent (primary UI)
 
@@ -103,8 +107,73 @@ uvicorn app.main:app --reload
 pytest
 ```
 
+The mocked unit/integration suite (`tests/`) runs on every push/PR via
+GitHub Actions (`.github/workflows/ci.yml`). The golden-dataset eval
+harness (`evals/run_evals.py`) makes real OpenAI/MCP calls and costs money
+per run, so it's intentionally *not* part of CI - run it manually when you
+want to check real-model behavior.
+
 ## Deployment
 
-This repo is set up to run as a Hugging Face Space directly (the YAML
-frontmatter at the top of this file configures it) - push to a Space repo
-with secrets set in the Spaces UI, and `app.py` is the entry point.
+**Primary target: Railway**, using the included `Dockerfile` and
+`railway.toml`. Push to a Railway-linked repo; it builds the Docker image
+and runs `python space_app.py`, reading the dynamic `$PORT` Railway
+assigns.
+
+This repo can also still run as a Hugging Face Space (the YAML frontmatter
+at the top of this file configures it, with `app_file: space_app.py` as
+the entry point) if you prefer that instead - note HF Spaces' Gradio/Docker
+SDK now requires a paid tier.
+
+### Persistence on Railway
+
+The SQLite database (`DATABASE_PATH`, default `lifeops.db`) lives on local
+disk inside the container - **without a persistent volume, every redeploy
+wipes it.** One-time setup:
+
+1. In the Railway dashboard, add a **Volume** to this service and mount it
+   at, e.g., `/data`.
+2. Set `DATABASE_PATH=/data/lifeops.db` in the service's environment
+   variables so the DB file lives on that volume instead of the ephemeral
+   container filesystem.
+3. Optionally, back up periodically: `python scripts/backup_db.py` dumps
+   the DB to a timestamped `.sql` file under `backups/` (gitignored) -
+   run it manually, or as a scheduled Railway cron service pointed at the
+   same volume.
+
+### Google Calendar on Railway
+
+Real Google Calendar access (as opposed to the local mock calendar) needs
+**two** things to survive on a headless host, and it's easy to get the
+first working locally but miss the second:
+
+1. **The OAuth client credentials JSON** (`GOOGLE_OAUTH_CREDENTIALS_PATH`) -
+   the file you download from Google Cloud Console.
+2. **A cached OAuth *token*** - generated the first time you authorize the
+   app, via an interactive browser consent flow. Locally this gets cached
+   automatically (by default under `~/.config/google-calendar-mcp/tokens.json`)
+   and everything "just works" after that first login. **Railway has no
+   browser and no way to complete that interactive flow**, so if all you do
+   is set `GOOGLE_OAUTH_CREDENTIALS_PATH` there, calendar access will
+   silently fall back to the local mock tool every time - there's no token
+   for it to use.
+
+To fix this, generate the token once locally, then carry it over:
+
+1. Run the app locally with `GOOGLE_OAUTH_CREDENTIALS_PATH` set and
+   complete the browser consent flow once (you'll see "Tokens updated and
+   saved" in the logs). Find the resulting token file - by default
+   `~/.config/google-calendar-mcp/tokens.json` on macOS/Linux.
+2. Upload both the credentials JSON and that `tokens.json` onto the same
+   persistent Railway volume you set up for the database (e.g. as
+   `/data/gcp-oauth.keys.json` and `/data/gcp-tokens.json` - Railway's
+   dashboard lets you open a shell on the volume, or you can `scp`/`railway
+   run` a copy).
+3. Set `GOOGLE_OAUTH_CREDENTIALS_PATH=/data/gcp-oauth.keys.json` and
+   `GOOGLE_CALENDAR_MCP_TOKEN_PATH=/data/gcp-tokens.json` in the service's
+   environment variables.
+
+**Never commit either of these files to git** - `tokens.json` contains a
+live refresh token for your real calendar. Both stay off the volume's
+public surface and out of the repo entirely; they only need to exist on
+the Railway volume itself.

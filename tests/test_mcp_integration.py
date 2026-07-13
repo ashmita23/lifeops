@@ -35,7 +35,7 @@ def test_build_tools_excludes_local_calendar_when_mcp_active(monkeypatch):
     ]
     monkeypatch.setattr(agent.mcp_client, "get_mcp_tools", lambda: fake_mcp_tools)
 
-    tools, mcp_active = agent._build_tools()
+    tools, mcp_active = agent._build_tools(include_confirm_tool=False)
 
     assert mcp_active is True
     tool_names = {t["function"]["name"] for t in tools}
@@ -47,7 +47,7 @@ def test_build_tools_excludes_local_calendar_when_mcp_active(monkeypatch):
 def test_build_tools_keeps_local_calendar_when_mcp_inactive(monkeypatch):
     monkeypatch.setattr(agent.mcp_client, "get_mcp_tools", lambda: [])
 
-    tools, mcp_active = agent._build_tools()
+    tools, mcp_active = agent._build_tools(include_confirm_tool=False)
 
     assert mcp_active is False
     tool_names = {t["function"]["name"] for t in tools}
