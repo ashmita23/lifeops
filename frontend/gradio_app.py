@@ -159,7 +159,14 @@ def main() -> None:
 
         agent_reset_btn.click(fn=handle_agent_reset, outputs=[chat, session_state])
 
-    demo.launch(theme=gr.themes.Ocean(), css=_CUSTOM_CSS)
+    # Railway (and most container hosts) assign a dynamic port via $PORT and
+    # expect the app to bind 0.0.0.0, not localhost. Defaults match local dev.
+    demo.launch(
+        theme=gr.themes.Ocean(),
+        css=_CUSTOM_CSS,
+        server_name=os.environ.get("SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.environ.get("PORT", 7860)),
+    )
 
 
 if __name__ == "__main__":
