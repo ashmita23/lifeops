@@ -35,6 +35,19 @@ _session_cm = None
 _stdio_cm = None
 _mcp_tools_cache: list[dict] | None = None
 
+# Human-readable calendar-connection status. The failure mode this exists for:
+# a misconfigured calendar silently degrades to the local mock with no visible
+# signal (exactly what happened on the first Railway deploy). Surfacing a
+# status here lets startup, a health check, or the UI say WHY calendar is
+# unavailable instead of leaving the user to guess. One of:
+#   "not_configured" | "connected" | "failed: <reason>"
+_status: str = "not_configured"
+
+
+def get_status() -> str:
+    """Current Google Calendar MCP connection status (see _status)."""
+    return _status
+
 
 def _server_params() -> StdioServerParameters | None:
     if not settings.google_oauth_credentials_path:
@@ -62,11 +75,15 @@ def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 
 async def _connect() -> None:
-    global _session, _session_cm, _stdio_cm
+    global _session, _session_cm, _stdio_cm, _status
 
     params = _server_params()
     if params is None:
-        logger.info("GOOGLE_OAUTH_CREDENTIALS_PATH not set - skipping Google Calendar MCP server.")
+        _status = "not_configured"
+        logger.info(
+            "GOOGLE_OAUTH_CREDENTIALS_PATH not set - skipping Google Calendar MCP server "
+            "(calendar features will use the local mock)."
+        )
         return
 
     try:
@@ -75,10 +92,20 @@ async def _connect() -> None:
         _session_cm = ClientSession(read, write)
         _session = await _session_cm.__aenter__()
         await _session.initialize()
+        _status = "connected"
         logger.info("Connected to Google Calendar MCP server.")
-    except Exception:
-        logger.warning("Could not start Google Calendar MCP server; continuing without it.", exc_info=True)
+    except Exception as exc:
         _session = None
+        _status = f"failed: {type(exc).__name__}: {exc}"
+        # WARNING (not info) and with the reason spelled out, because a silent
+        # fallback to the mock is the exact bug this surfacing prevents.
+        logger.warning(
+            "Could not start Google Calendar MCP server (%s) - calendar features will "
+            "fall back to the local mock. Check GOOGLE_OAUTH_CREDENTIALS_PATH and, on a "
+            "headless host, GOOGLE_CALENDAR_MCP_TOKEN_PATH.",
+            _status,
+            exc_info=True,
+        )
 
 
 def start() -> None:

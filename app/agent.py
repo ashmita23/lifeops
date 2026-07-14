@@ -12,10 +12,14 @@ Rules this loop follows (agreed with the user):
 2. Each tool result is appended to message history before the next call.
 3. No tool call in a response means that response is the final answer.
 4. Every attempted action is tracked in AgentTurnResult.actions.
-5-8. Destructive tools (name contains "delete") always pause for a human
-     confirmation turn before executing, even mid-chain; a confirmed delete
-     executes and ends the turn immediately (no further chaining); an
-     unconfirmed/stale pending confirmation is cleared, not left dangling.
+5-8. Destructive tools (name matches _DESTRUCTIVE_KEYWORDS: delete/remove/
+     cancel/trash) always pause for a human confirmation turn before
+     executing, even mid-chain. The exact proposed call is stored; the next
+     turn confirms via CONFIRM_TOOL_NAME, which replays that stored call -
+     nothing is ever regenerated or argument-matched. A confirmed action
+     executes and then processing CONTINUES so the rest of a multi-part
+     request in the same turn still gets handled. A stale/unconfirmed
+     pending confirmation is cleared, not left dangling.
 9. If the exact same (tool, arguments) repeats in one turn, stop early -
    the model is stuck, not making progress.
 10. Hitting the cap forces one final text-only summary of what got done.
@@ -479,8 +483,15 @@ _DECLINE_MESSAGE = "Okay, I won't go ahead with that."
 # discarded for the canned fallback instead. This does NOT depend on the
 # note working - it's a second, independent guardrail against the synthesis
 # step narrating a false "done" for an action that hasn't executed yet.
+#
+# Deliberately only PAST-TENSE outcome words ("deleted", not "delete"). The
+# earlier version also blocked "done"/"successfully"/"all set", which show up
+# in perfectly valid confirmation questions ("Once you confirm, this will be
+# done - proceed?") and caused false positives. A "should I ...?" question
+# uses present-tense verbs ("delete it?", "cancel it?"), so past-tense words
+# are a much tighter signal for an actual (false) completion claim.
 _FALSE_COMPLETION_MARKERS = (
-    "deleted", "removed", "cancelled", "canceled", "done", "completed", "successfully", "all set",
+    "deleted", "removed", "cancelled", "canceled", "has been", "have been",
 )
 
 _CONFIRM_CONTEXT_NOTE = {
@@ -702,15 +713,18 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
 
     messages = session_store.get_session_messages(session_id)
     if messages is None:
+        # Brand-new session: the system message is freshly built and NOT yet
+        # persisted, so persisted_count is 0 - _finish must write it too.
         messages = [{"role": "system", "content": _system_prompt(timezone, mcp_active)}]
+        persisted_count = 0
+    else:
+        # Loaded from the append-only log: every row is already durable, so
+        # only messages produced from here on are new.
+        persisted_count = len(messages)
 
-    # Everything already in `messages` is durably stored in append-only rows.
-    # Only messages produced from here on (the user turn + whatever the loop
-    # adds) are new, so `_finish` appends exactly `messages[persisted_count:]`
-    # and never rewrites an existing row. This is what keeps concurrent turns
+    # `_finish` appends exactly messages[persisted_count:] and never rewrites
+    # an existing row - that append-only write is what keeps concurrent turns
     # from clobbering each other.
-    persisted_count = len(messages)
-
     messages.append({"role": "user", "content": input_text})
 
     def _finish(result: AgentTurnResult) -> AgentTurnResult:

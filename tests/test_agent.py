@@ -49,7 +49,14 @@ def test_one_shot_tool_call_stores_reminder(monkeypatch):
     assert result.tool_called == "create_reminder"
     assert result.stored_record["title"] == "Call mom"
     assert "call mom" in result.message.lower()
-    assert session_store.get_session_messages(result.session_id) is not None
+
+    # The persisted history must start with the system message. Regression
+    # guard: with append-only storage it's easy to miscount which messages
+    # are "new" on a fresh session and silently drop the system prompt, which
+    # would make every later turn run with no instructions.
+    persisted = session_store.get_session_messages(result.session_id)
+    assert persisted is not None
+    assert persisted[0]["role"] == "system"
 
 
 def test_clarification_then_followup_completes(monkeypatch):

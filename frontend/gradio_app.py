@@ -79,8 +79,14 @@ _CUSTOM_CSS = """
 """
 
 
-def handle_agent_submit(multimodal_value: dict, session_id: str, history: list):
+def handle_agent_submit(multimodal_value: dict, session_id: str, history: list, timezone: str = ""):
     handler_start = time.perf_counter()
+
+    # The browser reports its own IANA timezone (see the demo.load JS hook);
+    # fall back to a sane default if it's missing so relative dates like
+    # "tomorrow at 5pm" resolve in the user's actual timezone, not the
+    # server's. Empty rather than None-safe because Gradio passes "".
+    timezone = timezone or "America/Chicago"
 
     text = (multimodal_value or {}).get("text", "") or ""
     files = (multimodal_value or {}).get("files") or []
@@ -98,7 +104,7 @@ def handle_agent_submit(multimodal_value: dict, session_id: str, history: list):
         return history, session_id
 
     agent_start = time.perf_counter()
-    result = run_agent_turn(session_id=session_id or None, input_text=text)
+    result = run_agent_turn(session_id=session_id or None, input_text=text, timezone=timezone)
     agent_latency_ms = (time.perf_counter() - agent_start) * 1000
 
     postprocess_start = time.perf_counter()
@@ -136,6 +142,17 @@ def main() -> None:
     init_db()
     mcp_client.start()
 
+    mcp_status = mcp_client.get_status()
+    if mcp_status == "connected":
+        logger.info("Google Calendar: connected via MCP.")
+    else:
+        logger.warning(
+            "Google Calendar: NOT connected (status=%s) - the app is using the local mock "
+            "calendar. This is fine locally; in production it means real calendar actions "
+            "won't happen. See README 'Google Calendar on Railway'.",
+            mcp_status,
+        )
+
     if settings.gradio_auth is None:
         logger.warning(
             "GRADIO_AUTH_USER/GRADIO_AUTH_PASS not set - the app is running with NO login "
@@ -151,6 +168,10 @@ def main() -> None:
         )
 
         session_state = gr.State("")
+        # Hidden field the browser fills with its own IANA timezone on load,
+        # so relative dates ("tomorrow at 5pm") resolve in the user's zone
+        # instead of the server's. Falls back to a default if JS is blocked.
+        tz_state = gr.Textbox(visible=False)
         chat = gr.Chatbot(label=None, show_label=False, elem_id="lifeops-chatbot", height=520)
         agent_input = gr.MultimodalTextbox(
             show_label=False,
@@ -161,9 +182,16 @@ def main() -> None:
         )
         agent_reset_btn = gr.Button("New conversation", size="sm", elem_id="lifeops-reset")
 
+        demo.load(
+            fn=None,
+            inputs=None,
+            outputs=tz_state,
+            js="() => Intl.DateTimeFormat().resolvedOptions().timeZone",
+        )
+
         agent_input.submit(
             fn=handle_agent_submit,
-            inputs=[agent_input, session_state, chat],
+            inputs=[agent_input, session_state, chat, tz_state],
             outputs=[chat, session_state],
         ).then(lambda: {"text": "", "files": []}, outputs=agent_input)
 
