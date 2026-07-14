@@ -3,6 +3,14 @@
 Replaces the in-memory SESSIONS/PENDING_CONFIRMATIONS dicts that used to
 live in app.agent - those were lost on every process restart. Same
 connection pattern as app/tools/*.py, reusing app.db.connection_scope.
+
+Conversation history is an APPEND-ONLY log (one row per message in the
+conversation_messages table), not a single blob rewritten each turn. That
+distinction is the whole point: a blob rewrite is a read-modify-write, so
+two concurrent turns on one session race and one silently loses its
+messages. An append is a plain INSERT the database serializes for us, so
+concurrent turns both land - nothing is lost. It also drops the per-turn
+write cost from O(whole history) to O(new messages).
 """
 
 import json
@@ -12,23 +20,29 @@ from app.db import connection_scope
 
 
 def get_session_messages(session_id: str) -> list[dict] | None:
+    """Full ordered message history for a session, or None if it has none.
+    Ordered by the autoincrement id, i.e. insertion order."""
     with connection_scope() as conn:
-        row = conn.execute(
-            "SELECT messages FROM conversations WHERE session_id = ?", (session_id,)
-        ).fetchone()
-    return json.loads(row["messages"]) if row else None
+        rows = conn.execute(
+            "SELECT message FROM conversation_messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+    if not rows:
+        return None
+    return [json.loads(row["message"]) for row in rows]
 
 
-def save_session_messages(session_id: str, messages: list[dict]) -> None:
+def append_messages(session_id: str, messages: list[dict]) -> None:
+    """Appends new messages as individual rows in one transaction. Only the
+    messages produced this turn should be passed - never the full history -
+    since existing rows are already durably stored and must not be rewritten."""
+    if not messages:
+        return
     now = datetime.now(timezone.utc).isoformat()
     with connection_scope() as conn:
-        conn.execute(
-            """
-            INSERT INTO conversations (session_id, messages, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET messages = excluded.messages, updated_at = excluded.updated_at
-            """,
-            (session_id, json.dumps(messages), now),
+        conn.executemany(
+            "INSERT INTO conversation_messages (session_id, message, created_at) VALUES (?, ?, ?)",
+            [(session_id, json.dumps(message), now) for message in messages],
         )
 
 

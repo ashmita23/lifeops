@@ -522,7 +522,12 @@ def _final_text(messages: list[dict], tools: list[dict], reason: str) -> str:
     false-completion language and discarded for the canned fallback if found -
     this is what protects against the synthesis step lying about success
     even if some unrelated bug produces a weird tool result later."""
-    call_messages = messages if reason != "confirm" else messages + [_CONFIRM_CONTEXT_NOTE]
+    # Trim to a bounded window for the model (the full history stays in the
+    # durable log); the ephemeral confirm note is added after trimming so it
+    # is never dropped by the window.
+    call_messages = _trim_history(messages)
+    if reason == "confirm":
+        call_messages = call_messages + [_CONFIRM_CONTEXT_NOTE]
 
     try:
         synthesis_message = call_llm_with_tools(call_messages, tools, tool_choice="none")
@@ -589,6 +594,20 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
         "information only the user can provide. If required information is missing "
         "(e.g. a reminder with no date/time), do NOT call a tool - instead ask a "
         "short, specific clarifying question in plain text.\n\n"
+        "When a single message contains more than one distinct request (e.g. "
+        "'schedule X and also delete Y'), address every part of it - never silently "
+        "act on only one and drop the rest. If one part pauses for confirmation "
+        "(e.g. a destructive action), your reply must explicitly say what you're "
+        "still waiting to do, so it isn't forgotten once the conversation moves on to "
+        "confirming the first part.\n\n"
+        "Never state a fact about the user's schedule (e.g. 'you have no other "
+        "meetings', 'your day is free') unless you have an actual, current tool "
+        "result in front of you that covers the FULL scope of what you're claiming. "
+        "A list/search call scoped to a narrow window (e.g. just tomorrow morning, "
+        "to find a free slot) only supports a claim about that narrow window - it "
+        "does not support a claim about the rest of the day or anything you haven't "
+        "actually queried. If asked about the whole day and you've only checked part "
+        "of it, call the list tool again for the full range before answering.\n\n"
         "After a tool result comes back, answer the user directly and usefully using "
         "that data - don't just confirm the tool ran. For example, if get_daily_summary "
         "comes back empty, tell them they're free and offer to schedule something; if "
@@ -685,10 +704,17 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
     if messages is None:
         messages = [{"role": "system", "content": _system_prompt(timezone, mcp_active)}]
 
+    # Everything already in `messages` is durably stored in append-only rows.
+    # Only messages produced from here on (the user turn + whatever the loop
+    # adds) are new, so `_finish` appends exactly `messages[persisted_count:]`
+    # and never rewrites an existing row. This is what keeps concurrent turns
+    # from clobbering each other.
+    persisted_count = len(messages)
+
     messages.append({"role": "user", "content": input_text})
 
     def _finish(result: AgentTurnResult) -> AgentTurnResult:
-        session_store.save_session_messages(session_id, _trim_history(messages))
+        session_store.append_messages(session_id, messages[persisted_count:])
         return result
 
     actions: list[dict] = []
@@ -719,7 +745,7 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
 
     while len(actions) < MAX_TOOL_ITERATIONS:
         try:
-            response_message = call_llm_with_tools(messages, tools)
+            response_message = call_llm_with_tools(_trim_history(messages), tools)
         except LLMUnavailableError:
             return _finish(AgentTurnResult(
                 session_id=session_id,

@@ -82,4 +82,34 @@ GOLDEN_CASES = [
         "expected_tools": ["delete-event"],
         "expected_keywords": ["cancel", "weekly sync eval"],
     },
+    {
+        # Regression case for a real reported bug: the agent scheduled an
+        # event, then claimed "no other meetings scheduled for the entire
+        # day" in a later turn - flatly contradicting the event it had just
+        # created itself. Requiring the follow-up answer to actually
+        # mention "lunch" forces it to be grounded in a real list-tool
+        # result for the full scope asked about, not an extrapolated guess.
+        "id": "availability_answer_reflects_real_events",
+        "turns": [
+            "schedule a lunch event with sam tomorrow at noon",
+            "what does my calendar look like tomorrow?",
+        ],
+        "expected_tools": None,
+        "expected_keywords": ["lunch"],
+    },
+    {
+        # Regression case for the other half of the same real bug: a single
+        # message asking for two things (create + delete) had its delete
+        # half silently dropped once the create half needed a confirmation
+        # round-trip. Checking the delete actually lands by the final turn
+        # confirms it isn't forgotten once the conversation moves on.
+        "id": "multi_part_request_delete_not_dropped",
+        "turns": [
+            "remind me to call mom tomorrow at 5pm",
+            "schedule a lunch event with sam tomorrow at noon and also delete my call mom reminder",
+            "yes, delete it",
+        ],
+        "expected_tools": ["delete_reminder"],
+        "expected_keywords": None,
+    },
 ]

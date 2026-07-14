@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     raw_text TEXT NOT NULL
 );
 
+-- Append-only conversation log: ONE row per message, never rewritten.
+-- Replaces the old single-blob-per-session `conversations` table. Because a
+-- new message is an INSERT (atomic) rather than a read-modify-write of the
+-- whole history, two concurrent turns on the same session can't clobber each
+-- other's messages (a "lost update"). Ordering within a session is by the
+-- autoincrement id = insertion order. See app/session_store.py.
+CREATE TABLE IF NOT EXISTS conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_session
+    ON conversation_messages (session_id, id);
+
+-- Legacy blob table, kept only so _migrate() can copy old rows into the new
+-- append-only table on first run. Nothing writes to it anymore.
 CREATE TABLE IF NOT EXISTS conversations (
     session_id TEXT PRIMARY KEY,
     messages TEXT NOT NULL,
@@ -56,6 +74,17 @@ CREATE TABLE IF NOT EXISTS pending_confirmations (
 def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(settings.database_path)
     conn.row_factory = sqlite3.Row
+    # WAL (Write-Ahead Logging): in SQLite's default rollback-journal mode a
+    # writer blocks all readers and vice versa. WAL lets readers keep reading
+    # while one writer writes - a big concurrency win for one PRAGMA. The
+    # setting is stored in the database file itself and persists across
+    # connections, but setting it here is idempotent and cheap.
+    conn.execute("PRAGMA journal_mode=WAL")
+    # WAL allows many readers + ONE writer, but two concurrent writers still
+    # contend for the write lock. Without this, the loser gets an immediate
+    # "database is locked" error; busy_timeout makes it wait up to 5s for the
+    # lock instead - so concurrent writers queue rather than fail.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -82,3 +111,34 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reminders ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    _migrate_conversations_to_rows(conn)
+
+
+def _migrate_conversations_to_rows(conn: sqlite3.Connection) -> None:
+    """One-time copy of the old single-blob-per-session `conversations` table
+    into the new append-only `conversation_messages` table. Best-effort and
+    idempotent: only runs when the new table is empty and the old one has
+    data, and never raises (a migration failure must not block startup)."""
+    import json
+    from datetime import datetime, timezone
+
+    try:
+        already = conn.execute("SELECT COUNT(*) AS n FROM conversation_messages").fetchone()["n"]
+        if already:
+            return  # new table already populated - nothing to migrate
+
+        old_rows = conn.execute("SELECT session_id, messages, updated_at FROM conversations").fetchall()
+        for row in old_rows:
+            try:
+                messages = json.loads(row["messages"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            created = row["updated_at"] or datetime.now(timezone.utc).isoformat()
+            for message in messages:
+                conn.execute(
+                    "INSERT INTO conversation_messages (session_id, message, created_at) VALUES (?, ?, ?)",
+                    (row["session_id"], json.dumps(message), created),
+                )
+    except sqlite3.OperationalError:
+        pass  # old table doesn't exist / schema mismatch - safe to skip
