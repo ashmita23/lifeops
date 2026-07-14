@@ -34,6 +34,7 @@ tool-calling decision loop isn't something the local parser can approximate.
 
 import json
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -689,6 +690,207 @@ def run_agent_turn(
         return result
 
 
+@dataclass
+class _TurnState:
+    """All state that accumulates across one user turn's tool-calling loop.
+
+    Pulled into an explicit object (instead of a stack of closures mutating
+    enclosing locals) so each mutation is a named method call you can follow -
+    and so the per-call logic can live in a free function that just takes this
+    state, rather than being trapped inside one 200-line function."""
+
+    session_id: str
+    input_text: str
+    tools: list[dict]
+    messages: list[dict]
+    persisted_count: int
+    pending_before: dict | None
+    actions: list[dict] = field(default_factory=list)
+    seen_calls: set = field(default_factory=set)
+    last_tool_name: str | None = None
+    last_record: dict | None = None
+
+    def append_assistant_tool_calls(self, tool_calls) -> None:
+        # One assistant message carrying ALL tool calls from this response,
+        # matching what the API actually returned - not one message per call.
+        # Every id here needs a matching "tool" result message before the next
+        # LLM call, real or a synthetic "not executed" placeholder.
+        self.messages.append({
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {"name": c.function.name, "arguments": c.function.arguments or "{}"},
+                }
+                for c in tool_calls
+            ],
+        })
+
+    def append_tool_result(self, call_id: str, content: dict) -> None:
+        self.messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(content)})
+
+    def record_action(self, tool_name: str, args: dict, record: dict) -> None:
+        status, error = _record_status(record)
+        self.actions.append(
+            {"tool": tool_name, "arguments": args, "status": status, "result": record, "error": error}
+        )
+        self.last_tool_name, self.last_record = tool_name, record
+
+    def finish(
+        self, *, done: bool, message: str, stored_record: dict | None = None, tool_called: str | None = None
+    ) -> AgentTurnResult:
+        # The single choke point every return path goes through: persist only
+        # the messages produced this turn (append-only, never rewriting an
+        # existing row - that's what keeps concurrent turns from clobbering
+        # each other) and build the result.
+        session_store.append_messages(self.session_id, self.messages[self.persisted_count:])
+        return AgentTurnResult(
+            session_id=self.session_id,
+            done=done,
+            message=message,
+            stored_record=stored_record,
+            tool_called=tool_called,
+            actions=self.actions,
+        )
+
+
+@dataclass
+class _Outcome:
+    """What processing one tool call tells the batch loop to do next:
+    - "continue": keep processing the rest of the batch
+    - "stop":     stop the batch with `reason`, handled after the loop
+    - "return":   end the whole turn immediately with `result`"""
+
+    kind: str
+    reason: str | None = None
+    tool_name: str | None = None
+    result: AgentTurnResult | None = None
+
+
+_CONTINUE = _Outcome("continue")
+
+
+def _process_confirmation(state: _TurnState, call, args: dict) -> _Outcome:
+    """Handle the meta-tool that satisfies a pending destructive confirmation
+    by replaying the EXACT stored call - never the arguments this call carries
+    (it only has `confirmed`), so nothing can drift or mismatch."""
+    confirmed = bool(args.get("confirmed"))
+    state.append_tool_result(call.id, {"status": "confirmed" if confirmed else "declined"})
+
+    if not confirmed:
+        return _Outcome("return", result=state.finish(done=False, message=_DECLINE_MESSAGE))
+
+    if state.pending_before is None:
+        # Shouldn't happen (the tool is only offered when a pending
+        # confirmation exists), but don't crash if it does.
+        return _CONTINUE
+
+    tool_name = state.pending_before["tool"]
+    tool_args = state.pending_before["arguments"]
+    if tool_name in TOOL_DISPATCH:
+        record = _execute_local_tool(tool_name, tool_args, state.input_text)
+    else:
+        record = mcp_client.call_mcp_tool(tool_name, tool_args)
+
+    state.record_action(tool_name, tool_args, record)
+    state.pending_before = None  # consumed - a later call in this batch can't reuse it
+    return _CONTINUE
+
+
+def _process_one_call(state: _TurnState, call) -> _Outcome:
+    """Process a single tool call from a (possibly batched) response and say
+    what the batch loop should do next. Each guard is one branch - cap,
+    repeat, confirm meta-tool, unknown tool, destructive pause, execute."""
+    tool_name = call.function.name
+
+    if len(state.actions) >= MAX_TOOL_ITERATIONS:
+        state.append_tool_result(call.id, {"status": "not_executed", "reason": "cap_reached"})
+        return _Outcome("stop", reason="cap")
+
+    try:
+        args = json.loads(call.function.arguments or "{}")
+    except json.JSONDecodeError:
+        args = {}
+
+    # Rule 9: same (tool, args) repeating this turn means the model is stuck -
+    # stop rather than burning the rest of the cap.
+    signature = (tool_name, json.dumps(args, sort_keys=True))
+    if signature in state.seen_calls:
+        state.append_tool_result(call.id, {"status": "not_executed", "reason": "repeat_detected"})
+        return _Outcome("stop", reason="repeat")
+    state.seen_calls.add(signature)
+
+    # The confirm tool is a meta-tool, not a dispatchable resource action -
+    # handle it before the unknown-tool check (it's never in TOOL_DISPATCH or
+    # the MCP tool list) and before the destructive gate (it's how that gate
+    # gets satisfied).
+    if tool_name == CONFIRM_TOOL_NAME:
+        return _process_confirmation(state, call, args)
+
+    is_known_local = tool_name in TOOL_DISPATCH
+    is_known_mcp = not is_known_local and mcp_client.is_mcp_tool(tool_name)
+
+    if not is_known_local and not is_known_mcp:
+        state.actions.append(
+            {"tool": tool_name, "arguments": args, "status": "error", "result": None, "error": "unknown tool"}
+        )
+        state.append_tool_result(call.id, {"error": f"Unknown tool '{tool_name}'"})
+        return _Outcome("stop", reason="unknown", tool_name=tool_name)
+
+    # Rules 5-8: proposing a destructive tool always pauses for an explicit
+    # human confirmation turn before it executes - no exceptions. The ONLY
+    # execution path for a destructive tool is via CONFIRM_TOOL_NAME, which
+    # replays the stored call exactly, so this never argument-matches.
+    if _is_destructive_tool(tool_name):
+        session_store.set_pending_confirmation(state.session_id, tool_name, args)
+        state.append_tool_result(call.id, {"status": "awaiting_confirmation"})
+        return _Outcome("stop", reason="confirm", tool_name=tool_name)
+
+    if is_known_local:
+        record = _execute_local_tool(tool_name, args, state.input_text)
+    else:
+        record = mcp_client.call_mcp_tool(tool_name, args)
+    state.append_tool_result(call.id, record)
+    state.record_action(tool_name, args, record)
+    # A confirmed/normal execution falls through and the batch keeps going, so
+    # the model can pick back up the rest of a multi-part request this turn.
+    return _CONTINUE
+
+
+def _finish_stopped(state: _TurnState, stop_reason: str, stop_tool_name: str | None) -> AgentTurnResult:
+    """Build the terminal result for a batch that stopped early. `unknown` and
+    `confirm` haven't completed the user's request (done=False); `cap` has done
+    as much as it will (done=True); `repeat` is done iff anything ran."""
+    if stop_reason == "unknown":
+        return state.finish(
+            done=False,
+            message=f"Model tried to call unknown tool '{stop_tool_name}'.",
+            tool_called=stop_tool_name,
+        )
+    if stop_reason == "confirm":
+        return state.finish(
+            done=False,
+            message=_final_text(state.messages, state.tools, reason="confirm"),
+            tool_called=stop_tool_name,
+        )
+    if stop_reason == "repeat":
+        return state.finish(
+            done=bool(state.actions),
+            message=_final_text(state.messages, state.tools, reason="repeat"),
+            stored_record=state.last_record,
+            tool_called=state.last_tool_name,
+        )
+    # cap
+    return state.finish(
+        done=True,
+        message=_final_text(state.messages, state.tools, reason="cap"),
+        stored_record=state.last_record,
+        tool_called=state.last_tool_name,
+    )
+
+
 def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> AgentTurnResult:
     if settings.demo_mode:
         return AgentTurnResult(
@@ -704,8 +906,8 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
         )
 
     # Snapshot (and clear) any pending delete-confirmation for this session.
-    # Rule 8: if this turn doesn't re-request confirmation, the stale
-    # pending state is gone - it never lingers past one follow-up turn.
+    # Rule 8: if this turn doesn't re-request confirmation, the stale pending
+    # state is gone - it never lingers past one follow-up turn.
     pending_before = session_store.pop_pending_confirmation(session_id)
 
     tools, mcp_active = _build_tools(include_confirm_tool=pending_before is not None)
@@ -713,7 +915,7 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
     messages = session_store.get_session_messages(session_id)
     if messages is None:
         # Brand-new session: the system message is freshly built and NOT yet
-        # persisted, so persisted_count is 0 - _finish must write it too.
+        # persisted, so persisted_count is 0 - finish() must write it too.
         messages = [{"role": "system", "content": _system_prompt(timezone, mcp_active)}]
         persisted_count = 0
     else:
@@ -721,244 +923,63 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
         # only messages produced from here on are new.
         persisted_count = len(messages)
 
-    # `_finish` appends exactly messages[persisted_count:] and never rewrites
-    # an existing row - that append-only write is what keeps concurrent turns
-    # from clobbering each other.
     messages.append({"role": "user", "content": input_text})
 
-    def _finish(result: AgentTurnResult) -> AgentTurnResult:
-        session_store.append_messages(session_id, messages[persisted_count:])
-        return result
+    state = _TurnState(
+        session_id=session_id,
+        input_text=input_text,
+        tools=tools,
+        messages=messages,
+        persisted_count=persisted_count,
+        pending_before=pending_before,
+    )
 
-    actions: list[dict] = []
-    seen_calls: set[tuple] = set()
-    last_tool_name: str | None = None
-    last_record: dict | None = None
-
-    def _append_assistant_tool_calls(tool_calls) -> None:
-        # One assistant message carrying ALL tool calls from this response,
-        # matching what the API actually returned - not one message per
-        # call. Every id here needs a matching "tool" result message before
-        # the next LLM call, real or a synthetic "not executed" placeholder.
-        messages.append({
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": c.id,
-                    "type": "function",
-                    "function": {"name": c.function.name, "arguments": c.function.arguments or "{}"},
-                }
-                for c in tool_calls
-            ],
-        })
-
-    def _append_tool_result(call_id: str, content: dict) -> None:
-        messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(content)})
-
-    while len(actions) < MAX_TOOL_ITERATIONS:
+    while len(state.actions) < MAX_TOOL_ITERATIONS:
         try:
-            response_message = call_llm_with_tools(_trim_history(messages), tools)
+            response_message = call_llm_with_tools(_trim_history(state.messages), tools)
         except LLMUnavailableError:
-            return _finish(AgentTurnResult(
-                session_id=session_id,
-                done=bool(actions),
+            return state.finish(
+                done=bool(state.actions),
                 message="Agent mode requires OPENAI_API_KEY to be set.",
-                stored_record=last_record,
-                tool_called=last_tool_name,
-                actions=actions,
-            ))
+                stored_record=state.last_record,
+                tool_called=state.last_tool_name,
+            )
 
         tool_calls = getattr(response_message, "tool_calls", None)
         if not tool_calls:
             assistant_text = response_message.content or "Could you clarify what you'd like me to do?"
-            messages.append({"role": "assistant", "content": assistant_text})
-            return _finish(AgentTurnResult(
-                session_id=session_id,
-                done=bool(actions),
+            state.messages.append({"role": "assistant", "content": assistant_text})
+            return state.finish(
+                done=bool(state.actions),
                 message=assistant_text,
-                stored_record=last_record,
-                tool_called=last_tool_name,
-                actions=actions,
-            ))
+                stored_record=state.last_record,
+                tool_called=state.last_tool_name,
+            )
 
         # The model may batch multiple actions into one response (confirmed
-        # live: responses with 2-4 tool calls at once). Process all of them
-        # in this same round-trip instead of one-per-LLM-call.
-        _append_assistant_tool_calls(tool_calls)
+        # live: 2-4 tool calls at once). Process them all in this round-trip.
+        state.append_assistant_tool_calls(tool_calls)
 
         stop_reason: str | None = None
         stop_tool_name: str | None = None
-
         for call in tool_calls:
-            tool_name = call.function.name
-            raw_args = call.function.arguments or "{}"
-
             if stop_reason is not None:
-                # Already decided to stop this turn - every remaining call
-                # still needs a result so the message history stays valid,
-                # without actually executing anything further.
-                _append_tool_result(call.id, {"status": "not_executed", "reason": stop_reason})
+                # Already stopping this turn - every remaining call still needs
+                # a result so the message history stays valid, without
+                # executing anything further.
+                state.append_tool_result(call.id, {"status": "not_executed", "reason": stop_reason})
                 continue
 
-            if len(actions) >= MAX_TOOL_ITERATIONS:
-                _append_tool_result(call.id, {"status": "not_executed", "reason": "cap_reached"})
-                stop_reason = "cap"
-                continue
+            outcome = _process_one_call(state, call)
+            if outcome.kind == "return":
+                return outcome.result
+            if outcome.kind == "stop":
+                stop_reason = outcome.reason
+                stop_tool_name = outcome.tool_name
 
-            try:
-                args = json.loads(raw_args)
-            except json.JSONDecodeError:
-                args = {}
+        if stop_reason is not None:
+            return _finish_stopped(state, stop_reason, stop_tool_name)
+        # Clean batch - loop back for the model's next decision or final answer.
 
-            # Rule 9: same (tool, args) repeating this turn means the model
-            # is stuck - stop rather than burning the rest of the cap.
-            call_signature = (tool_name, json.dumps(args, sort_keys=True))
-            if call_signature in seen_calls:
-                _append_tool_result(call.id, {"status": "not_executed", "reason": "repeat_detected"})
-                stop_reason = "repeat"
-                continue
-            seen_calls.add(call_signature)
-
-            # The confirm tool is a meta-tool, not a normal dispatchable
-            # resource action - handle it before the unknown-tool check
-            # (it's never in TOOL_DISPATCH or the MCP tool list) and before
-            # the destructive-tool gate (it's how that gate gets satisfied).
-            if tool_name == CONFIRM_TOOL_NAME:
-                confirmed = bool(args.get("confirmed"))
-                _append_tool_result(call.id, {"status": "confirmed" if confirmed else "declined"})
-
-                if not confirmed:
-                    return _finish(AgentTurnResult(
-                        session_id=session_id,
-                        done=False,
-                        message=_DECLINE_MESSAGE,
-                        stored_record=None,
-                        tool_called=None,
-                        actions=actions,
-                    ))
-
-                if pending_before is None:
-                    # Shouldn't happen (the tool is only offered when a
-                    # pending confirmation exists), but don't crash if it does.
-                    continue
-
-                # Execute the EXACT action stored when it first paused - never
-                # whatever arguments this call itself carries (it only has
-                # `confirmed`). There is nothing here to regenerate or
-                # compare, so nothing can drift or mismatch.
-                pending_tool_name = pending_before["tool"]
-                pending_args = pending_before["arguments"]
-                if pending_tool_name in TOOL_DISPATCH:
-                    record = _execute_local_tool(pending_tool_name, pending_args, input_text)
-                else:
-                    record = mcp_client.call_mcp_tool(pending_tool_name, pending_args)
-
-                status, error = _record_status(record)
-                actions.append(
-                    {"tool": pending_tool_name, "arguments": pending_args, "status": status, "result": record, "error": error}
-                )
-                last_tool_name, last_record = pending_tool_name, record
-                pending_before = None  # consumed - a later call in this batch can't reuse it
-                continue
-
-            handler = TOOL_DISPATCH.get(tool_name)
-            is_known_local = handler is not None
-            is_known_mcp = not is_known_local and mcp_client.is_mcp_tool(tool_name)
-
-            if not is_known_local and not is_known_mcp:
-                actions.append(
-                    {"tool": tool_name, "arguments": args, "status": "error", "result": None, "error": "unknown tool"}
-                )
-                _append_tool_result(call.id, {"error": f"Unknown tool '{tool_name}'"})
-                stop_reason = "unknown"
-                stop_tool_name = tool_name
-                continue
-
-            # Rules 5-8: destructive tools always pause for an explicit human
-            # confirmation turn before they execute - no exceptions here.
-            # The ONLY execution path for a destructive tool is via
-            # CONFIRM_TOOL_NAME above, which replays the stored call exactly -
-            # this branch never re-checks "was this already confirmed" by
-            # comparing arguments, since there's nothing left to compare.
-            if _is_destructive_tool(tool_name):
-                session_store.set_pending_confirmation(session_id, tool_name, args)
-                _append_tool_result(call.id, {"status": "awaiting_confirmation"})
-                stop_reason = "confirm"
-                stop_tool_name = tool_name
-                continue
-
-            if is_known_local:
-                record = _execute_local_tool(tool_name, args, input_text)
-            else:
-                record = mcp_client.call_mcp_tool(tool_name, args)
-
-            status, error = _record_status(record)
-            _append_tool_result(call.id, record)
-
-            actions.append({"tool": tool_name, "arguments": args, "status": status, "result": record, "error": error})
-            last_tool_name, last_record = tool_name, record
-
-            # Rule 7 (revised): only *proposing* an unconfirmed destructive
-            # call pauses the turn (handled above). A confirmed execution
-            # (via CONFIRM_TOOL_NAME) falls through like any other tool call -
-            # processing continues so the model can pick back up the rest
-            # of a multi-part request in this same turn.
-
-        if stop_reason == "unknown":
-            return _finish(AgentTurnResult(
-                session_id=session_id,
-                done=False,
-                message=f"Model tried to call unknown tool '{stop_tool_name}'.",
-                stored_record=None,
-                tool_called=stop_tool_name,
-                actions=actions,
-            ))
-
-        if stop_reason == "confirm":
-            confirmation_text = _final_text(messages, tools, reason="confirm")
-            return _finish(AgentTurnResult(
-                session_id=session_id,
-                done=False,
-                message=confirmation_text,
-                stored_record=None,
-                tool_called=stop_tool_name,
-                actions=actions,
-            ))
-
-        if stop_reason == "repeat":
-            final_text = _final_text(messages, tools, reason="repeat")
-            return _finish(AgentTurnResult(
-                session_id=session_id,
-                done=bool(actions),
-                message=final_text,
-                stored_record=last_record,
-                tool_called=last_tool_name,
-                actions=actions,
-            ))
-
-        if stop_reason == "cap":
-            final_text = _final_text(messages, tools, reason="cap")
-            return _finish(AgentTurnResult(
-                session_id=session_id,
-                done=True,
-                message=final_text,
-                stored_record=last_record,
-                tool_called=last_tool_name,
-                actions=actions,
-            ))
-
-        # No stop reason - the whole batch executed cleanly, loop back for
-        # the model's next decision (or its final answer).
-
-    # Rule 10: cap hit without an explicit stop_reason=="cap" return above
-    # (defensive fallback - normally that path already returns first).
-    final_text = _final_text(messages, tools, reason="cap")
-    return _finish(AgentTurnResult(
-        session_id=session_id,
-        done=True,
-        message=final_text,
-        stored_record=last_record,
-        tool_called=last_tool_name,
-        actions=actions,
-    ))
+    # Rule 10: cap hit without an in-batch cap stop above (defensive fallback).
+    return _finish_stopped(state, "cap", None)
