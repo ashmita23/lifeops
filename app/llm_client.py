@@ -1,9 +1,9 @@
 """OpenAI-compatible LLM client abstraction.
 
-If OPENAI_API_KEY is configured, call_llm() sends the prompt to a real
-OpenAI-compatible chat completions endpoint. Otherwise it raises
-LLMUnavailableError so callers (namely app.parser) can fall back to the
-deterministic local parser used for offline demo mode.
+call_llm_with_tools() sends a chat history plus tool schemas to a real
+OpenAI-compatible chat completions endpoint. With no OPENAI_API_KEY it
+raises LLMUnavailableError, which the agent surfaces as a "requires an API
+key" message (there is no offline fallback for tool-calling).
 """
 
 # app.config must be imported (and its load_dotenv() run) before langfuse,
@@ -32,19 +32,6 @@ def _get_client():
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url or _DEFAULT_OPENAI_BASE_URL,
     )
-
-
-def call_llm(prompt: str) -> str:
-    if settings.demo_mode:
-        raise LLMUnavailableError("No OPENAI_API_KEY configured; running in demo mode")
-
-    client = _get_client()
-    response = client.chat.completions.create(
-        model=settings.openai_model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    return response.choices[0].message.content or ""
 
 
 def call_llm_with_tools(messages: list[dict], tools: list[dict], tool_choice: str = "auto"):

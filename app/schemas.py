@@ -6,19 +6,10 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
-InputType = Literal["text", "voice"]
 IntentType = Literal[
     "reminder", "calendar_event", "journal_entry", "daily_summary", "unknown"
 ]
 Priority = Literal["low", "medium", "high"]
-
-
-class UserCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    input_text: str
-    input_type: InputType = "text"
-    timezone: str = "America/Chicago"
 
 
 class ParsedIntent(BaseModel):
@@ -35,23 +26,6 @@ class ParsedIntent(BaseModel):
     needs_clarification: bool = False
     clarification_question: Optional[str] = None
     raw_text: str
-
-
-class AgentResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    success: bool
-    message: str
-    intent: ParsedIntent
-    stored_record: Optional[dict] = None
-
-
-class AgentTurnRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: Optional[str] = None
-    input_text: str
-    timezone: str = "America/Chicago"
 
 
 class ToolAction(BaseModel):

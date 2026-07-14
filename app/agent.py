@@ -1,7 +1,6 @@
 """Tool-calling agent with a bounded multi-step loop and a clarification flow.
 
-Unlike app.parser/app.services.router (single-shot classify-then-route),
-this hands the LLM real tool definitions and lets it decide which ones to
+This hands the LLM real tool definitions and lets it decide which ones to
 call, in what order, and with what arguments - up to MAX_TOOL_ITERATIONS
 per user turn, so a single message like "list my reminders, mark the tax
 one done, and create a calendar event to celebrate" can complete in one
@@ -47,7 +46,7 @@ from langfuse import get_client, observe, propagate_attributes
 
 from app.llm_client import LLMUnavailableError, call_llm_with_tools
 from app.schemas import AgentTurnResult, ParsedIntent
-from app.services.router import get_daily_summary
+from app.services.summary import get_daily_summary
 from app.tools.calendar_mock import (
     create_calendar_event,
     delete_calendar_event,
