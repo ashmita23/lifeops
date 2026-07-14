@@ -89,17 +89,30 @@ python frontend/gradio_app.py
 python space_app.py
 ```
 
-## Run the FastAPI backend
+## Architecture (v2)
 
-```bash
-uvicorn app.main:app --reload
-```
+- **LLM gateway** (`app/llm_gateway.py`, via LiteLLM) — one choke point that
+  routes cheap/synthesis calls to a local quantized model (Ollama) and real
+  tool-calling to a cloud model, with an in-process response cache and automatic
+  local→cloud fallback. Feature-flagged by `MODEL_ROUTING_ENABLED` (off ⇒ all
+  cloud, the instant rollback lever).
+- **Per-session guardrails** (`app/budget.py`) — token/cost accounting from
+  `response.usage`, a cost cap and a rate limit (both raise `BudgetExceededError`,
+  ending the turn cleanly). Per-turn cost/tokens/latency show up as a footer in
+  the chat and in structured logs.
+- **Supervisor + specialists** — the agent loop is the supervisor; it delegates
+  to `plan_schedule` (find free calendar slots) and `book_reservation`
+  (`app/specialists/`). Booking is a human-in-the-loop action: it pauses for
+  explicit approval + ID (guest name) before executing, reusing the same
+  approval gate as destructive deletes.
+- **Injection guardrails** (`app/guardrails.py`) — untrusted tool data (e.g. a
+  calendar/reminder title) is fenced as data before re-entering context;
+  destructive/booking actions require human approval regardless.
+- **Ops docs** — `docs/runbook.md` (incident first-actions + rollback levers),
+  `docs/tech-debt.md` (what's done vs open).
 
-- `GET /` - health check
-- `POST /command` - classic regex/single-shot path
-- `POST /agent/command` - the real tool-calling agent
-- `POST /agent/voice-command` - agent + Whisper transcription
-- `GET /summary/today` - today's reminders, events, journal entries
+To try local model routing: install [Ollama](https://ollama.com), run
+`ollama pull llama3.1:8b`, then set `MODEL_ROUTING_ENABLED=true`.
 
 ## Run tests
 

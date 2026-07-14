@@ -11,20 +11,28 @@
   an explicit `_TurnState` object plus `_process_one_call` / `_process_confirmation`
   / `_finish_stopped`. Behavior-preserving (test suite green before and after);
   largest logic function dropped from ~200 to ~58 lines.
+- **Cost/budget cap** — per-session cost cap + rate limit now enforced
+  (`app/budget.py`), raising `BudgetExceededError` which the agent ends the turn
+  on. Tokens/cost captured from `response.usage` via the gateway.
+- **Prompt-injection hardening** — untrusted tool data is now fenced
+  (`app/guardrails.py`, wired into `_TurnState.append_tool_result`); destructive
+  AND booking actions still require human approval regardless.
+- **Evals** — LLM-as-judge + trajectory checks added (`evals/run_evals.py`),
+  plus injection/planner/booking golden cases.
 
-## Still open (lower priority — the original AI-eng gaps)
+## Still open (lower priority)
 
-- **Cost/budget cap** — actions per turn are capped (`MAX_TOOL_ITERATIONS`);
-  dollars spent are not. A confused loop could still run up a real bill.
-- **Prompt-injection hardening** — text pulled back into context from calendar
-  events / reminders is treated the same as trusted instructions. Should be
-  fenced as data.
-- **Evals** — mostly keyword-match; upgrading some cases to LLM-judged grading
-  would catch semantic regressions string-matching misses.
+- **MCP-aware planner** — `plan_schedule` reads the local calendar; when Google
+  Calendar (MCP) is connected, events live there, so the planner won't see them
+  until we parse MCP `list-events` into busy blocks. Demo the planner with MCP
+  off (local calendar) for now. `considered_events` in its result reports how
+  many it actually accounted for.
 - **PII in traces** — API keys are redacted before reaching Langfuse, but actual
   calendar/reminder content (personal data) is not.
 - **Long-term memory** — history is trimmed (dropped) for the model's context
   window, never summarized. Fine for a demo; a real limit for long sessions.
+- **Cache/rate-limit durability** — the response cache and rate-limit window are
+  in-process; multi-replica deployment would want Redis-backed versions.
 
 ## Known latent behavior (documented, not yet fixed)
 
