@@ -63,6 +63,8 @@ from app.tools.reminders import (
     list_reminders,
     update_reminder,
 )
+from app.specialists.booking import book_reservation
+from app.specialists.planner import plan_schedule
 
 MAX_TOOL_ITERATIONS = 5
 
@@ -329,6 +331,58 @@ _LOCAL_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_schedule",
+            "description": (
+                "Delegate to the planner specialist to find free time and propose WHEN to "
+                "schedule something. Use this when the user wants help deciding a time "
+                "(e.g. 'find an hour tomorrow morning for deep work'), NOT when they give an "
+                "explicit time. Returns proposed start times; confirm one with the user, then "
+                "create the event with the calendar tool."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "What to schedule"},
+                    "date": {"type": "string", "description": "ISO date (YYYY-MM-DD) to schedule on"},
+                    "duration_minutes": {"type": "integer", "description": "Length of the block in minutes"},
+                    "preference": {
+                        "type": "string",
+                        "enum": ["morning", "afternoon", "evening", "any"],
+                        "description": "Preferred time of day",
+                    },
+                },
+                "required": ["title", "date", "duration_minutes", "preference"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_reservation",
+            "description": (
+                "Delegate to the booking specialist to reserve a restaurant table. This is a "
+                "high-stakes action requiring the user's explicit approval AND ID verification "
+                "(the guest name) before it executes - expect it to pause for confirmation."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "restaurant": {"type": "string", "description": "Restaurant name"},
+                    "datetime": {"type": "string", "description": "ISO date/time of the reservation"},
+                    "party_size": {"type": "integer", "description": "Number of guests"},
+                    "guest_name": {"type": "string", "description": "Name on the reservation, used for ID verification"},
+                },
+                "required": ["restaurant", "datetime", "party_size", "guest_name"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -440,6 +494,9 @@ TOOL_DISPATCH = {
     "delete_calendar_event": _dispatch_delete_calendar_event,
     "list_journal_entries": _dispatch_list_journal_entries,
     "delete_journal_entry": _dispatch_delete_journal_entry,
+    # Specialist tools the supervisor delegates to (app/specialists/).
+    "plan_schedule": plan_schedule,
+    "book_reservation": book_reservation,
 }
 
 
@@ -451,6 +508,11 @@ def _execute_local_tool(tool_name: str, args: dict, input_text: str) -> dict:
 
 _DESTRUCTIVE_KEYWORDS = ("delete", "remove", "cancel", "trash")
 
+# Non-destructive but high-stakes tools that also need explicit human approval
+# before executing (e.g. booking spends money / makes a commitment in the real
+# world). Listed by exact name since they don't share a destructive verb.
+_APPROVAL_REQUIRED_TOOLS = frozenset({"book_reservation"})
+
 
 def _is_destructive_tool(name: str) -> bool:
     # Name-based heuristic - covers our own tools (all "delete_*") and the
@@ -460,6 +522,13 @@ def _is_destructive_tool(name: str) -> bool:
     # without us noticing the safety gate silently stopped applying.
     lowered = name.lower()
     return any(keyword in lowered for keyword in _DESTRUCTIVE_KEYWORDS)
+
+
+def _requires_approval(name: str) -> bool:
+    """Any tool that must pause for explicit human confirmation before it
+    executes - destructive tools plus the named high-stakes ones. This is the
+    single gate both the tool-hiding logic and the pause logic consult."""
+    return _is_destructive_tool(name) or name in _APPROVAL_REQUIRED_TOOLS
 
 
 def _record_status(record: dict) -> tuple[str, str | None]:
@@ -576,13 +645,12 @@ def _build_tools(include_confirm_tool: bool) -> tuple[list[dict], bool]:
     tools = local_tools + mcp_tools
 
     if include_confirm_tool:
-        # While a destructive action is pending confirmation, hide ALL
-        # destructive tools from the model entirely for this turn - the
-        # only way to actually execute one is via the confirm tool below,
-        # which replays the exact original pending call. This is a hard,
-        # code-enforced guarantee, not just a prompt instruction the model
-        # could ignore.
-        tools = [t for t in tools if not _is_destructive_tool(t["function"]["name"])]
+        # While an action is pending confirmation, hide ALL approval-required
+        # tools (destructive + high-stakes like booking) from the model for
+        # this turn - the only way to actually execute one is via the confirm
+        # tool below, which replays the exact original pending call. This is a
+        # hard, code-enforced guarantee, not just a prompt instruction.
+        tools = [t for t in tools if not _requires_approval(t["function"]["name"])]
         tools = tools + [_CONFIRM_TOOL]
 
     return tools, mcp_active
@@ -647,7 +715,15 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
         "'schedule/set up/add a calendar event/invite/meeting' means the calendar tool "
         "only. Only create both if the user explicitly asks for both (e.g. 'remind me AND "
         "put it on my calendar') - do not create a calendar event just because a reminder "
-        "was requested, or vice versa."
+        "was requested, or vice versa.\n\n"
+        "You delegate two kinds of work to specialists. When the user wants help DECIDING "
+        "when to do something rather than giving an explicit time (e.g. 'find me an hour "
+        "tomorrow morning for deep work', 'when can I fit in a workout?'), call plan_schedule "
+        "to get proposed free slots, then present a slot and, once the user picks one, create "
+        "the calendar event. When the user wants to reserve a restaurant table, call "
+        "book_reservation - it needs a guest name for ID verification and will pause for the "
+        "user's explicit approval before booking (respond via respond_to_pending_confirmation "
+        "just like a delete)."
         + (
             "\n\nYou have access to the user's real Google Calendar through the connected "
             "calendar tools - use those (not any local mock) for scheduling, listing, "
@@ -846,11 +922,12 @@ def _process_one_call(state: _TurnState, call) -> _Outcome:
         state.append_tool_result(call.id, {"error": f"Unknown tool '{tool_name}'"})
         return _Outcome("stop", reason="unknown", tool_name=tool_name)
 
-    # Rules 5-8: proposing a destructive tool always pauses for an explicit
-    # human confirmation turn before it executes - no exceptions. The ONLY
-    # execution path for a destructive tool is via CONFIRM_TOOL_NAME, which
-    # replays the stored call exactly, so this never argument-matches.
-    if _is_destructive_tool(tool_name):
+    # Rules 5-8: proposing an approval-required tool (destructive OR high-stakes
+    # like booking) always pauses for an explicit human confirmation turn before
+    # it executes - no exceptions. The ONLY execution path is via
+    # CONFIRM_TOOL_NAME, which replays the stored call exactly, so this never
+    # argument-matches.
+    if _requires_approval(tool_name):
         session_store.set_pending_confirmation(state.session_id, tool_name, args)
         state.append_tool_result(call.id, {"status": "awaiting_confirmation"})
         return _Outcome("stop", reason="confirm", tool_name=tool_name)
