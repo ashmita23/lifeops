@@ -10,7 +10,7 @@ import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import mcp_client
+from app import budget, mcp_client
 from app.agent import run_agent_turn
 from app.config import settings
 from app.db import init_db
@@ -103,14 +103,26 @@ def handle_agent_submit(multimodal_value: dict, session_id: str, history: list, 
     if not text or not text.strip():
         return history, session_id
 
+    # Snapshot cumulative usage before the turn so we can report THIS turn's
+    # delta (a turn may make several LLM calls - loop + synthesis).
+    usage_before = budget.get_usage(session_id) if session_id else {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
+
     agent_start = time.perf_counter()
     result = run_agent_turn(session_id=session_id or None, input_text=text, timezone=timezone)
     agent_latency_ms = (time.perf_counter() - agent_start) * 1000
 
+    usage_after = budget.get_usage(result.session_id)
+    turn_tokens = (
+        (usage_after["prompt_tokens"] + usage_after["completion_tokens"])
+        - (usage_before["prompt_tokens"] + usage_before["completion_tokens"])
+    )
+    turn_cost = usage_after["cost_usd"] - usage_before["cost_usd"]
+    footer = f"\n\n<sub>⏱ {agent_latency_ms / 1000:.1f}s · {turn_tokens} tok · ${turn_cost:.4f}</sub>"
+
     postprocess_start = time.perf_counter()
     history = history + [
         {"role": "user", "content": text},
-        {"role": "assistant", "content": result.message},
+        {"role": "assistant", "content": result.message + footer},
     ]
     postprocess_latency_ms = (time.perf_counter() - postprocess_start) * 1000
 
@@ -121,10 +133,13 @@ def handle_agent_submit(multimodal_value: dict, session_id: str, history: list, 
 
     total_handler_latency_ms = (time.perf_counter() - handler_start) * 1000
     logger.info(
-        "chat turn latency: agent=%.1fms postprocess=%.1fms total=%.1fms",
+        "chat turn: agent=%.1fms postprocess=%.1fms total=%.1fms tokens=%d cost=$%.4f errors=%d",
         agent_latency_ms,
         postprocess_latency_ms,
         total_handler_latency_ms,
+        turn_tokens,
+        turn_cost,
+        usage_after.get("error_count", 0),
     )
 
     return history, result.session_id

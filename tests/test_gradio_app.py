@@ -2,7 +2,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
+
 import frontend.gradio_app as ga
+from app import config, db
+
+
+@pytest.fixture(autouse=True)
+def temp_database(tmp_path, monkeypatch):
+    # The handler now reads per-session usage for the observability footer,
+    # which queries the session_usage table - so the DB must exist.
+    monkeypatch.setattr(config.settings, "database_path", str(tmp_path / "gradio.db"))
+    db.init_db()
+    yield
 
 
 def _fake_result(message="ok", session_id="sess-1", trace_id="trace-1"):
@@ -27,7 +39,7 @@ def test_slow_trace_export_does_not_delay_chat_reply(monkeypatch):
 
     assert elapsed < 1.0  # must not block on the 2s "export"
     assert session_id == "sess-1"
-    assert history[-1]["content"] == "ok"
+    assert history[-1]["content"].startswith("ok")  # reply + observability footer
 
     test_executor.shutdown(wait=True)  # let the background task finish before moving on
 
@@ -54,8 +66,9 @@ def test_handler_logs_latency_breakdown(monkeypatch, caplog):
     with caplog.at_level("INFO", logger="frontend.gradio_app"):
         ga.handle_agent_submit({"text": "hello", "files": []}, "", [])
 
-    assert "chat turn latency" in caplog.text
+    assert "chat turn" in caplog.text
     assert "agent=" in caplog.text
     assert "total=" in caplog.text
+    assert "cost=" in caplog.text  # observability surface includes cost now
 
     test_executor.shutdown(wait=True)

@@ -45,7 +45,8 @@ from app.config import settings
 
 from langfuse import get_client, observe, propagate_attributes
 
-from app.llm_client import LLMUnavailableError, call_llm_with_tools
+from app.budget import BudgetExceededError
+from app.llm_client import LLMUnavailableError, call_llm_with_tools, session_scope
 from app.schemas import AgentTurnResult, ParsedIntent
 from app.services.summary import get_daily_summary
 from app.tools.calendar_mock import (
@@ -543,7 +544,9 @@ def _final_text(messages: list[dict], tools: list[dict], reason: str) -> str:
     try:
         synthesis_message = call_llm_with_tools(call_messages, tools, tool_choice="none")
         final_text = synthesis_message.content or _FALLBACK_MESSAGES.get(reason, "Done.")
-    except LLMUnavailableError:
+    except (LLMUnavailableError, BudgetExceededError):
+        # No model available (no key) or budget/rate cap hit during synthesis -
+        # fall back to the canned phrasing rather than crashing the turn.
         final_text = _FALLBACK_MESSAGES.get(reason, "Done.")
 
     if reason == "confirm" and any(marker in final_text.lower() for marker in _FALSE_COMPLETION_MARKERS):
@@ -671,7 +674,11 @@ def run_agent_turn(
     # is the right thing to group traces by (see app.session_store).
     session_id = session_id or str(uuid.uuid4())
 
-    with propagate_attributes(session_id=session_id, trace_name="run_agent_turn"):
+    # session_scope makes session_id available to call_llm_with_tools (for
+    # per-session budget/usage) without adding it as a parameter that would
+    # break the mocked signature in tests. propagate_attributes groups the
+    # Langfuse trace by the same session.
+    with session_scope(session_id), propagate_attributes(session_id=session_id, trace_name="run_agent_turn"):
         # Set explicit trace input/output instead of letting @observe capture
         # raw function args (which would include internal params like
         # timezone) - keep the trace readable and scoped to what matters.
@@ -941,6 +948,15 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
             return state.finish(
                 done=bool(state.actions),
                 message="Agent mode requires OPENAI_API_KEY to be set.",
+                stored_record=state.last_record,
+                tool_called=state.last_tool_name,
+            )
+        except BudgetExceededError as exc:
+            # Per-session budget/rate cap hit. Stop cleanly with what's already
+            # done rather than spending more - done=True since we won't retry.
+            return state.finish(
+                done=True,
+                message=str(exc),
                 stored_record=state.last_record,
                 tool_called=state.last_tool_name,
             )

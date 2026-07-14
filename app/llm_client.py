@@ -1,58 +1,76 @@
-"""OpenAI-compatible LLM client abstraction.
+"""LLM entry point for the agent.
 
-call_llm_with_tools() sends a chat history plus tool schemas to a real
-OpenAI-compatible chat completions endpoint. With no OPENAI_API_KEY it
-raises LLMUnavailableError, which the agent surfaces as a "requires an API
-key" message (there is no offline fallback for tool-calling).
+call_llm_with_tools() is the single choke point every LLM call flows through.
+It runs the per-session guardrails (rate limit, budget cap), delegates the
+actual provider call to the gateway (which handles model routing, caching, and
+local->cloud fallback), records token/cost usage, and returns the raw response
+message so callers keep inspecting .tool_calls / .content directly.
+
+The session id is carried on a contextvar (session_scope) rather than a
+function argument, so the public signature stays exactly
+(messages, tools, tool_choice) - the agent's tests monkeypatch this function
+with that signature, and threading a new parameter through would break them.
 """
 
-# app.config must be imported (and its load_dotenv() run) before langfuse,
-# or Langfuse may initialize its singleton client with missing credentials.
-from app.config import settings
+import contextlib
+import contextvars
 
-from langfuse.openai import OpenAI  # drop-in: auto-captures model/tokens/cost
-# as a proper "generation" observation, nested under whatever @observe span
-# is active (e.g. app.agent.run_agent_turn) - no manual @observe needed here.
+from app.config import settings
+from app import budget, llm_gateway
 
 
 class LLMUnavailableError(RuntimeError):
     """Raised when no LLM backend is configured."""
 
 
-_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+# Request-scoped session id, set by run_agent_turn via session_scope(). The
+# real call reads it for per-session budget/usage; mocked calls in tests never
+# touch it, so the function signature stays unchanged.
+_session_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("lifeops_session_id", default=None)
 
 
-def _get_client():
-    # Always pass an explicit, non-empty base_url. python-dotenv loads
-    # OPENAI_BASE_URL= (empty) into the process environment, and the openai
-    # SDK falls back to reading that env var itself if we don't pass one -
-    # an empty-but-present value wins over the SDK's own default and breaks
-    # every request. Passing a real string here always short-circuits that.
-    return OpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url or _DEFAULT_OPENAI_BASE_URL,
-    )
+@contextlib.contextmanager
+def session_scope(session_id: str | None):
+    token = _session_ctx.set(session_id)
+    try:
+        yield
+    finally:
+        _session_ctx.reset(token)
 
 
 def call_llm_with_tools(messages: list[dict], tools: list[dict], tool_choice: str = "auto"):
     """Sends a chat history plus tool schemas and returns the raw response
     message object, so callers can inspect .tool_calls or .content directly.
 
-    tool_choice="none" forces a plain-text response with no further tool
-    calls - used for the synthesis/confirmation/repeat/cap-summary steps
-    after a tool has already run. In that case, the ~13-22 tool schemas
-    are omitted from the request entirely rather than sent-but-unusable -
-    tool_choice="none" already makes it impossible for the model to call
-    anything, so there's no reason to pay the prompt-size cost of
-    describing tools it's forbidden from using."""
+    tool_choice="none" forces a plain-text response with no further tool calls
+    (the synthesis/confirmation/summary steps); the tool schemas are omitted
+    from the request entirely rather than sent-but-unusable."""
     if settings.demo_mode:
         raise LLMUnavailableError("No OPENAI_API_KEY configured; running in demo mode")
 
-    client = _get_client()
-    kwargs = {"model": settings.openai_model, "messages": messages, "temperature": 0}
-    if tool_choice != "none":
-        kwargs["tools"] = tools
-        kwargs["tool_choice"] = tool_choice
+    session_id = _session_ctx.get()
 
-    response = client.chat.completions.create(**kwargs)
-    return response.choices[0].message
+    # Per-session guardrails run BEFORE the call so an over-budget or
+    # over-rate session never spends more. Both raise BudgetExceededError,
+    # which the agent catches and turns into a clean end-of-turn message.
+    if session_id is not None:
+        budget.check_rate(session_id)
+        budget.check_budget(session_id)
+
+    try:
+        result = llm_gateway.complete(messages, tools, tool_choice)
+    except Exception:
+        if session_id is not None:
+            budget.record_error(session_id)
+        raise
+
+    # A cache hit consumed no new tokens and cost nothing, so it is not billed.
+    if session_id is not None and result.usage is not None and not result.cache_hit:
+        budget.add_usage(
+            session_id,
+            prompt_tokens=getattr(result.usage, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(result.usage, "completion_tokens", 0) or 0,
+            cost_usd=result.cost_usd,
+        )
+
+    return result.message

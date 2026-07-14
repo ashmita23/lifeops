@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS pending_confirmations (
     arguments TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Per-session token/cost/error accounting (see app/budget.py). Backs the
+-- budget cap and the observability surface. Written once per LLM call.
+CREATE TABLE IF NOT EXISTS session_usage (
+    session_id TEXT PRIMARY KEY,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    call_count INTEGER NOT NULL DEFAULT 0,
+    error_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 """
 
 

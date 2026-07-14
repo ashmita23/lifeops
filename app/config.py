@@ -11,6 +11,24 @@ class Settings:
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY") or None
     openai_base_url: str | None = os.getenv("OPENAI_BASE_URL") or None
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    # --- LLM gateway / model routing (see app/llm_gateway.py) ---
+    # The cheap "local" tier is a quantized open model served by Ollama; the
+    # cloud tier is the strong model. Routing sends simple/synthesis calls to
+    # local and real tool-calling to cloud, with local->cloud fallback.
+    cloud_model: str = os.getenv("CLOUD_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    local_model: str = os.getenv("LOCAL_MODEL", "ollama/llama3.1:8b")
+    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    local_timeout_seconds: float = float(os.getenv("LOCAL_TIMEOUT_SECONDS", "20"))
+    # Feature flag: when False, every call uses the cloud model (routing off).
+    # This is the minimal canary/rollback lever - flip without a redeploy.
+    model_routing_enabled: bool = os.getenv("MODEL_ROUTING_ENABLED", "false").lower() == "true"
+
+    # Response cache + per-session guardrails (see app/budget.py).
+    llm_cache_enabled: bool = os.getenv("LLM_CACHE_ENABLED", "true").lower() == "true"
+    session_cost_cap_usd: float = float(os.getenv("SESSION_COST_CAP_USD", "1.00"))
+    session_rate_limit_per_min: int = int(os.getenv("SESSION_RATE_LIMIT_PER_MIN", "60"))
+
     database_path: str = os.getenv("DATABASE_PATH", "lifeops.db")
     default_timezone: str = os.getenv("DEFAULT_TIMEZONE", "America/Chicago")
     google_oauth_credentials_path: str | None = os.getenv("GOOGLE_OAUTH_CREDENTIALS_PATH") or None
