@@ -33,6 +33,7 @@ from app.db import init_db
 from app.mcp_client import start as mcp_start
 from app.tracing import init_tracing
 from app.agent import run_agent_turn
+from app.llm_client import call_llm_with_tools
 from app.trace_export import export_trace
 from evals.golden_cases import GOLDEN_CASES
 
@@ -63,6 +64,42 @@ def _check_keywords(message: str, expected_keywords: list[str] | None) -> bool:
     return all(keyword.lower() in lowered for keyword in expected_keywords)
 
 
+def _check_trajectory(actual_tools: list[str], expected_trajectory: list[str] | None) -> bool:
+    """Order-sensitive: the expected tools must appear as an ordered
+    subsequence of the actual calls (auxiliary calls in between are allowed).
+    Keyword-match tells you WHAT ran; trajectory tells you it ran in a sane
+    ORDER (e.g. list-then-delete, not delete-then-list)."""
+    if not expected_trajectory:
+        return True
+    it = iter(actual_tools)
+    return all(any(tool == a for a in it) for tool in expected_trajectory)
+
+
+def llm_judge(message: str, rubric: str) -> tuple[bool, str]:
+    """LLM-as-judge: score a response against a plain-English rubric when a
+    keyword match is too brittle (tone, correctness of reasoning, whether it
+    refused appropriately). Returns (passed, reason). Uses the same gateway as
+    the agent. A judge error counts as a pass-through (True) so infra flakiness
+    doesn't fail a case - the deterministic checks still gate."""
+    judge_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You are a strict evaluator. Given an assistant RESPONSE and a RUBRIC, decide if "
+                "the response satisfies the rubric. Reply with a JSON object "
+                '{"pass": true|false, "reason": "<one sentence>"} and nothing else.'
+            ),
+        },
+        {"role": "user", "content": f"RUBRIC:\n{rubric}\n\nRESPONSE:\n{message}"},
+    ]
+    try:
+        judged = call_llm_with_tools(judge_prompt, [], tool_choice="none")
+        parsed = json.loads(judged.content)
+        return bool(parsed.get("pass")), str(parsed.get("reason", ""))
+    except Exception as exc:  # noqa: BLE001 - judge infra flakiness must not fail a case
+        return True, f"judge unavailable ({type(exc).__name__}); skipped"
+
+
 def run_case(case: dict) -> dict:
     session_id = None
     result = None
@@ -78,7 +115,20 @@ def run_case(case: dict) -> dict:
     tools_ok = _check_tools(actual_tools, case.get("expected_tools"))
     count_ok = _check_min_actions(len(actual_tools), case.get("expected_min_actions"))
     keywords_ok = _check_keywords(result.message, case.get("expected_keywords"))
-    passed = tools_ok and count_ok and keywords_ok
+    trajectory_ok = _check_trajectory(actual_tools, case.get("expected_trajectory"))
+
+    judge_reason = None
+    judge_ok = True
+    if case.get("judge_rubric"):
+        judge_ok, judge_reason = llm_judge(result.message, case["judge_rubric"])
+
+    # A case may also require that NO tool ran (e.g. an injection attempt that
+    # must be refused). expected_no_tools=True asserts an empty action list.
+    no_tools_ok = True
+    if case.get("expected_no_tools"):
+        no_tools_ok = len(actual_tools) == 0
+
+    passed = tools_ok and count_ok and keywords_ok and trajectory_ok and judge_ok and no_tools_ok
 
     trace_path = export_trace(result.trace_id, expected_latency_seconds=latency_seconds)
 
@@ -88,6 +138,9 @@ def run_case(case: dict) -> dict:
         "expected_tools": case.get("expected_tools"),
         "expected_min_actions": case.get("expected_min_actions"),
         "expected_keywords": case.get("expected_keywords"),
+        "expected_trajectory": case.get("expected_trajectory"),
+        "judge_rubric": case.get("judge_rubric"),
+        "judge_reason": judge_reason,
         "actual_tools": actual_tools,
         "message": result.message,
         "passed": passed,

@@ -33,6 +33,7 @@ tool-calling decision loop isn't something the local parser can approximate.
 """
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -40,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 # app.config must be imported (and its load_dotenv() run) before langfuse,
 # or Langfuse may initialize its singleton client with missing credentials.
-from app import mcp_client, session_store
+from app import guardrails, mcp_client, session_store
 from app.config import settings
 
 from langfuse import get_client, observe, propagate_attributes
@@ -65,6 +66,8 @@ from app.tools.reminders import (
 )
 from app.specialists.booking import book_reservation
 from app.specialists.planner import plan_schedule
+
+logger = logging.getLogger(__name__)
 
 MAX_TOOL_ITERATIONS = 5
 
@@ -812,6 +815,10 @@ class _TurnState:
         })
 
     def append_tool_result(self, call_id: str, content: dict) -> None:
+        # Fence any injection-shaped text in the result (e.g. a calendar event
+        # titled "ignore previous instructions...") so it re-enters context as
+        # data, not a command. No-op for clean results.
+        content = guardrails.fence_if_untrusted(content)
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(content)})
 
     def record_action(self, tool_name: str, args: dict, record: dict) -> None:
@@ -988,6 +995,14 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
             tool_called=None,
             actions=[],
         )
+
+    # Flag injection-shaped user input for observability. Not blocked - the
+    # user is the principal and may legitimately say "ignore that"; the real
+    # defense is fencing untrusted TOOL DATA (see _TurnState.append_tool_result)
+    # plus the code-enforced approval gate.
+    flagged = guardrails.scan(input_text)
+    if flagged:
+        logger.warning("guardrail: user input matched injection patterns %s", flagged)
 
     # Snapshot (and clear) any pending delete-confirmation for this session.
     # Rule 8: if this turn doesn't re-request confirmation, the stale pending
