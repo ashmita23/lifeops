@@ -49,9 +49,15 @@ def test_find_free_slots_returns_empty_when_no_room():
     assert slots == []
 
 
-def test_plan_schedule_proposes_around_existing_event():
+def test_plan_schedule_proposes_around_existing_event(monkeypatch):
     from app.schemas import ParsedIntent
+    from app.specialists import planner
     from app.tools.calendar_mock import create_calendar_event
+
+    # Force the local-calendar path: this test seeds a local event and asserts
+    # the planner plans around it. (When a real Google Calendar is connected the
+    # planner prefers get-freebusy; that path is covered by a live check.)
+    monkeypatch.setattr(planner, "_busy_from_google", lambda day: None)
 
     create_calendar_event(
         ParsedIntent(

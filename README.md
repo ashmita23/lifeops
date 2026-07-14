@@ -101,10 +101,11 @@ python space_app.py
   ending the turn cleanly). Per-turn cost/tokens/latency show up as a footer in
   the chat and in structured logs.
 - **Supervisor + specialists** — the agent loop is the supervisor; it delegates
-  to `plan_schedule` (find free calendar slots) and `book_reservation`
-  (`app/specialists/`). Booking is a human-in-the-loop action: it pauses for
-  explicit approval + ID (guest name) before executing, reusing the same
-  approval gate as destructive deletes.
+  to `plan_schedule` (finds free slots around your **real Google Calendar** via
+  the MCP get-freebusy tool, falling back to the local calendar if Calendar
+  isn't connected) and `book_reservation` (`app/specialists/`). Booking is a
+  human-in-the-loop action: it pauses for explicit approval + ID (guest name)
+  before executing, reusing the same approval gate as destructive deletes.
 - **Injection guardrails** (`app/guardrails.py`) — untrusted tool data (e.g. a
   calendar/reminder title) is fenced as data before re-entering context;
   destructive/booking actions require human approval regardless.

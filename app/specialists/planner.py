@@ -10,6 +10,7 @@ supervisor to confirm and create. Deterministic on purpose: a live demo of
 arithmetic.
 """
 
+import json
 from datetime import datetime, time, timedelta
 
 from app.tools.calendar_mock import list_calendar_events
@@ -89,16 +90,56 @@ def _event_bounds(event: dict) -> tuple[datetime, datetime] | None:
     return start, start + timedelta(minutes=minutes)
 
 
+def _busy_from_google(day) -> list[tuple[datetime, datetime]] | None:
+    """Busy blocks for `day` from the real Google Calendar via the MCP
+    get-freebusy tool, or None if the calendar isn't connected. get-freebusy
+    returns structured busy intervals (not free-text events), so this is a
+    reliable parse. Times come back timezone-aware in the calendar's own
+    offset; we drop the tzinfo to compare against the naive wall-clock window."""
+    from app import mcp_client  # local import to avoid any import cycle
+
+    if not mcp_client.is_mcp_tool("get-freebusy"):
+        return None
+
+    args = {
+        "calendars": [{"id": "primary"}],
+        "timeMin": f"{day.isoformat()}T00:00:00",
+        "timeMax": f"{day.isoformat()}T23:59:59",
+    }
+    try:
+        out = mcp_client.call_mcp_tool("get-freebusy", args)
+        if out.get("is_error") or not out.get("result"):
+            return None
+        payload = json.loads(out["result"][0])
+        busy: list[tuple[datetime, datetime]] = []
+        for cal in payload.get("calendars", {}).values():
+            for block in cal.get("busy", []):
+                start = datetime.fromisoformat(block["start"]).replace(tzinfo=None)
+                end = datetime.fromisoformat(block["end"]).replace(tzinfo=None)
+                busy.append((start, end))
+        return busy
+    except Exception:
+        return None  # any parse/transport issue -> let the caller fall back
+
+
+def _busy_from_local(day) -> list[tuple[datetime, datetime]]:
+    busy = []
+    for event in list_calendar_events():
+        bounds = _event_bounds(event)
+        if bounds and bounds[0].date() == day:
+            busy.append(bounds)
+    return busy
+
+
 def plan_schedule(args: dict, raw_text: str) -> dict:
     """Tool handler. args: title, date (ISO date), duration_minutes,
     preference (morning|afternoon|evening|any). Returns proposed start times;
     the supervisor confirms with the user and creates the event.
 
-    Reads the app's local calendar. When the real Google Calendar (MCP) is
-    connected, events live there instead, so the planner won't see them yet -
-    parsing live MCP events into busy blocks is a documented stretch
-    (docs/tech-debt.md). `considered_events` in the result reports how many it
-    actually accounted for, so the caller can be transparent about it."""
+    Reads busy blocks from the real Google Calendar (via MCP get-freebusy) when
+    connected, otherwise from the app's local calendar. `calendar_source` in the
+    result says which, and `considered_events` how many busy blocks it planned
+    around."""
     title = args.get("title") or "Untitled"
     date_str = args.get("date")
     duration_minutes = int(args.get("duration_minutes") or 60)
@@ -112,11 +153,11 @@ def plan_schedule(args: dict, raw_text: str) -> dict:
     window_start = datetime.combine(day, _DAY_START)
     window_end = datetime.combine(day, _DAY_END)
 
-    busy = []
-    for event in list_calendar_events():
-        bounds = _event_bounds(event)
-        if bounds and bounds[0].date() == day:
-            busy.append(bounds)
+    busy = _busy_from_google(day)
+    calendar_source = "google_calendar"
+    if busy is None:
+        busy = _busy_from_local(day)
+        calendar_source = "local"
 
     slots = find_free_slots(
         busy, window_start, window_end, duration_minutes, preference=preference
@@ -129,4 +170,5 @@ def plan_schedule(args: dict, raw_text: str) -> dict:
         "preference": preference,
         "proposed_slots": [s.isoformat() for s in slots],
         "considered_events": len(busy),
+        "calendar_source": calendar_source,
     }

@@ -22,11 +22,6 @@
 
 ## Still open (lower priority)
 
-- **MCP-aware planner** — `plan_schedule` reads the local calendar; when Google
-  Calendar (MCP) is connected, events live there, so the planner won't see them
-  until we parse MCP `list-events` into busy blocks. Demo the planner with MCP
-  off (local calendar) for now. `considered_events` in its result reports how
-  many it actually accounted for.
 - **PII in traces** — API keys are redacted before reaching Langfuse, but actual
   calendar/reminder content (personal data) is not.
 - **Long-term memory** — history is trimmed (dropped) for the model's context
