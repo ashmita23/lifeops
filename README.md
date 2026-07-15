@@ -109,6 +109,12 @@ python space_app.py
 - **Injection guardrails** (`app/guardrails.py`) — untrusted tool data (e.g. a
   calendar/reminder title) is fenced as data before re-entering context;
   destructive/booking actions require human approval regardless.
+- **Journal RAG** (`app/journal_index.py`, `app/embeddings.py`) — journal
+  entries are embedded (OpenAI) and stored in **Pinecone** (managed serverless
+  vector DB); the `search_journal` tool retrieves relevant past entries so the
+  agent answers reflective/recall questions grounded in them. Evaluated with
+  Langfuse managed LLM-as-judge evaluators (faithfulness / context-relevance /
+  answer-relevance) — see `docs/rag-evals.md`. No-ops without `PINECONE_API_KEY`.
 - **Ops docs** — `docs/runbook.md` (incident first-actions + rollback levers),
   `docs/tech-debt.md` (what's done vs open).
 

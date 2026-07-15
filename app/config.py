@@ -29,6 +29,16 @@ class Settings:
     session_cost_cap_usd: float = float(os.getenv("SESSION_COST_CAP_USD", "1.00"))
     session_rate_limit_per_min: int = int(os.getenv("SESSION_RATE_LIMIT_PER_MIN", "60"))
 
+    # --- RAG over journal entries (see app/journal_index.py, app/embeddings.py) ---
+    # Retrieval uses Pinecone (managed serverless vector DB). All RAG features
+    # no-op gracefully when PINECONE_API_KEY is unset (see rag_enabled), so the
+    # app and tests run fine without it.
+    pinecone_api_key: str | None = os.getenv("PINECONE_API_KEY") or None
+    pinecone_index_name: str = os.getenv("PINECONE_INDEX_NAME", "lifeops-journal")
+    pinecone_cloud: str = os.getenv("PINECONE_CLOUD", "aws")
+    pinecone_region: str = os.getenv("PINECONE_REGION", "us-east-1")
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
     database_path: str = os.getenv("DATABASE_PATH", "lifeops.db")
     default_timezone: str = os.getenv("DEFAULT_TIMEZONE", "America/Chicago")
     google_oauth_credentials_path: str | None = os.getenv("GOOGLE_OAUTH_CREDENTIALS_PATH") or None
@@ -48,6 +58,13 @@ class Settings:
         if self.gradio_auth_user and self.gradio_auth_pass:
             return (self.gradio_auth_user, self.gradio_auth_pass)
         return None
+
+    @property
+    def rag_enabled(self) -> bool:
+        """RAG (journal retrieval) is available only when Pinecone is
+        configured and a real embedding model can be called. Everything RAG
+        checks this and degrades to a no-op otherwise."""
+        return bool(self.pinecone_api_key) and not self.demo_mode
 
     # langfuse's SDK auto-reads LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY/LANGFUSE_HOST
     # from the environment itself; these are only kept here so we can log

@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 # app.config must be imported (and its load_dotenv() run) before langfuse,
 # or Langfuse may initialize its singleton client with missing credentials.
-from app import guardrails, mcp_client, session_store
+from app import guardrails, journal_index, mcp_client, session_store
 from app.config import settings
 
 from langfuse import get_client, observe, propagate_attributes
@@ -337,6 +337,28 @@ _LOCAL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_journal",
+            "description": (
+                "Semantic search over the user's past journal entries by meaning (not exact "
+                "words). Call this to answer reflective or recall questions about what they've "
+                "journaled - e.g. 'what have I been worried about?', 'summarize my mood this "
+                "month' - then ground your answer in the returned entries."
+            ),
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for, in natural language"},
+                    "k": {"type": ["integer", "null"], "description": "How many entries to retrieve (default 5)"},
+                },
+                "required": ["query", "k"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "plan_schedule",
             "description": (
                 "Delegate to the planner specialist to find free time and propose WHEN to "
@@ -421,7 +443,21 @@ def _dispatch_create_journal_entry(args: dict, raw_text: str) -> dict:
         description=args.get("content"),
         raw_text=raw_text,
     )
-    return create_journal_entry(intent)
+    record = create_journal_entry(intent)
+    # Index for RAG retrieval. Best-effort: an embedding/Pinecone failure (or no
+    # Pinecone configured) must never fail the write. No-op when RAG is off.
+    try:
+        journal_index.index_entry(record["id"], record.get("content") or "")
+    except Exception:
+        logger.warning("Failed to index journal entry %s for RAG.", record.get("id"), exc_info=True)
+    return record
+
+
+def _dispatch_search_journal(args: dict, raw_text: str) -> dict:
+    if not settings.rag_enabled:
+        return {"status": "unavailable", "reason": "journal search (RAG) is not configured"}
+    results = journal_index.retrieve(args["query"], args.get("k") or 5)
+    return {"results": results}
 
 
 def _dispatch_get_daily_summary(args: dict, raw_text: str) -> dict:
@@ -497,6 +533,7 @@ TOOL_DISPATCH = {
     "delete_calendar_event": _dispatch_delete_calendar_event,
     "list_journal_entries": _dispatch_list_journal_entries,
     "delete_journal_entry": _dispatch_delete_journal_entry,
+    "search_journal": _dispatch_search_journal,
     # Specialist tools the supervisor delegates to (app/specialists/).
     "plan_schedule": plan_schedule,
     "book_reservation": book_reservation,
@@ -726,7 +763,10 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
         "the calendar event. When the user wants to reserve a restaurant table, call "
         "book_reservation - it needs a guest name for ID verification and will pause for the "
         "user's explicit approval before booking (respond via respond_to_pending_confirmation "
-        "just like a delete)."
+        "just like a delete).\n\n"
+        "For reflective or recall questions about the user's past journal entries (e.g. 'what "
+        "have I been anxious about?', 'summarize my mood this month'), call search_journal "
+        "first and ground your answer in the entries it returns - do not answer from memory."
         + (
             "\n\nYou have access to the user's real Google Calendar through the connected "
             "calendar tools - use those (not any local mock) for scheduling, listing, "
