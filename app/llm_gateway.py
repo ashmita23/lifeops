@@ -9,8 +9,9 @@ conditionals sprinkled through the call sites.
 Provider calls go through LiteLLM, a thin gateway over many providers
 (OpenAI, Anthropic, Ollama, ...) that all return the same OpenAI-shaped
 response object - so callers keep using .choices[0].message.tool_calls/
-.content/.usage unchanged. Langfuse cost/token capture is wired via LiteLLM's
-callback in app.tracing, not the old langfuse.openai drop-in.
+.content/.usage unchanged. Langfuse cost/token capture is recorded directly
+around the completion call in _traced_completion (the native Langfuse 4.x SDK),
+because no LiteLLM callback is compatible with Langfuse 4.x - see app.tracing.
 """
 
 import hashlib
@@ -93,6 +94,49 @@ def _cost_of(response) -> float:
         return 0.0
 
 
+def _traced_completion(model: str, messages: list[dict], tools: list[dict], tool_choice: str):
+    """Call litellm.completion, recording it as a Langfuse GENERATION nested
+    under the active @observe trace.
+
+    We log the generation from here with the native Langfuse 4.x SDK rather
+    than via a LiteLLM callback: LiteLLM 1.92.0 (the newest release) ships no
+    callback compatible with Langfuse 4.x - see app/tracing.py. We already have
+    the model, tokens (response.usage) and cost, so this reproduces the
+    tokens+cost generation the old callback used to emit, with no version
+    conflict. Tracing failures never touch the LLM call itself."""
+    kwargs = _completion_kwargs(model, messages, tools, tool_choice)
+    if not settings.tracing_enabled:
+        return litellm.completion(**kwargs)
+
+    from langfuse import get_client
+
+    with get_client().start_as_current_observation(
+        as_type="generation", name="llm_call", input=messages, model=model
+    ) as generation:
+        response = litellm.completion(**kwargs)
+        try:
+            usage = getattr(response, "usage", None)
+            usage_details = None
+            if usage is not None:
+                usage_details = {
+                    k: v
+                    for k, v in {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                        "completion_tokens": getattr(usage, "completion_tokens", None),
+                        "total_tokens": getattr(usage, "total_tokens", None),
+                    }.items()
+                    if v is not None
+                }
+            generation.update(
+                output=response.choices[0].message,
+                usage_details=usage_details,
+                cost_details={"total": _cost_of(response)},
+            )
+        except Exception:  # noqa: BLE001 - never let trace bookkeeping break the call
+            logger.warning("Failed to record generation details to Langfuse.", exc_info=True)
+        return response
+
+
 def complete(messages: list[dict], tools: list[dict], tool_choice: str) -> GatewayResult:
     """Route -> (cache) -> call, falling back local->cloud on any local error.
 
@@ -110,7 +154,7 @@ def complete(messages: list[dict], tools: list[dict], tool_choice: str) -> Gatew
 
     fell_back = False
     try:
-        response = litellm.completion(**_completion_kwargs(model, messages, tools, tool_choice))
+        response = _traced_completion(model, messages, tools, tool_choice)
         served_model = model
     except Exception:
         if not _is_local(model):
@@ -119,9 +163,7 @@ def complete(messages: list[dict], tools: list[dict], tool_choice: str) -> Gatew
                        exc_info=True)
         served_model = settings.cloud_model
         fell_back = True
-        response = litellm.completion(
-            **_completion_kwargs(served_model, messages, tools, tool_choice)
-        )
+        response = _traced_completion(served_model, messages, tools, tool_choice)
 
     if settings.llm_cache_enabled:
         if len(_CACHE) >= _CACHE_MAX_ENTRIES:
