@@ -49,9 +49,36 @@ class Settings:
 
     # Shared-password gate for the publicly reachable Gradio UI (see
     # frontend/gradio_app.py). Both must be set for auth to actually apply -
-    # deliberately no silent bypass if only one is configured.
+    # deliberately no silent bypass if only one is configured. Superseded by
+    # per-user "Sign in with Google" (below) when that is configured.
     gradio_auth_user: str | None = os.getenv("GRADIO_AUTH_USER") or None
     gradio_auth_pass: str | None = os.getenv("GRADIO_AUTH_PASS") or None
+
+    # --- Per-user "Sign in with Google" web auth (see app/web.py, app/auth.py) ---
+    # Requires a *Web application* OAuth client (distinct from the Desktop
+    # client the single-user MCP calendar uses in app/mcp_client.py), created in
+    # Google Cloud Console with OAUTH_REDIRECT_URI registered on it. When these
+    # aren't set, the web app runs single-user with NO login (local dev / tests
+    # are unaffected) - see google_login_enabled.
+    google_oauth_client_id: str | None = os.getenv("GOOGLE_OAUTH_CLIENT_ID") or None
+    google_oauth_client_secret: str | None = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or None
+    # Absolute URL Google redirects back to after consent - e.g.
+    # http://localhost:7860/oauth2callback locally, or
+    # https://<railway-domain>/oauth2callback in production. Must be registered
+    # verbatim on the OAuth client in Google Cloud Console.
+    oauth_redirect_uri: str = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:7860/oauth2callback")
+    # Signs the login session cookie (Starlette SessionMiddleware). Set a stable
+    # random value in production so logins survive restarts.
+    session_secret: str = os.getenv("SESSION_SECRET", "dev-insecure-session-secret-change-me")
+    # Fernet key (urlsafe base64, 32 bytes) that encrypts stored Google refresh
+    # tokens at rest. Generate with cryptography.fernet.Fernet.generate_key().
+    token_encryption_key: str | None = os.getenv("TOKEN_ENCRYPTION_KEY") or None
+
+    @property
+    def google_login_enabled(self) -> bool:
+        """True when a Web OAuth client is configured, switching the app into
+        multi-user "Sign in with Google" mode. Off -> single-user, no login."""
+        return bool(self.google_oauth_client_id and self.google_oauth_client_secret)
 
     @property
     def gradio_auth(self) -> tuple[str, str] | None:

@@ -79,8 +79,21 @@ _CUSTOM_CSS = """
 """
 
 
-def handle_agent_submit(multimodal_value: dict, session_id: str, history: list, timezone: str = ""):
+def handle_agent_submit(
+    multimodal_value: dict,
+    session_id: str,
+    history: list,
+    timezone: str = "",
+    request: gr.Request | None = None,
+):
     handler_start = time.perf_counter()
+
+    # In multi-user mode app/web.py's auth_dependency puts the signed-in Google
+    # user id on gr.Request.username (None in single-user local dev). Captured
+    # here; Phase 3 threads it into run_agent_turn to scope data per user.
+    user_id = getattr(request, "username", None) if request is not None else None
+    if user_id:
+        logger.debug("agent turn for user_id=%s", user_id)
 
     # The browser reports its own IANA timezone (see the demo.load JS hook);
     # fall back to a sane default if it's missing so relative dates like
@@ -149,33 +162,15 @@ def handle_agent_reset():
     return [], ""
 
 
-def main() -> None:
-    # Side-effecting startup (DB init, MCP subprocess, real UI construction)
-    # lives here, not at module level, so importing this module (e.g. from
-    # tests) never triggers it - only actually running it as a script does.
-    init_tracing()
-    init_db()
-    mcp_client.start()
+def build_demo() -> gr.Blocks:
+    """Construct the Gradio UI (no side effects, no server started).
 
-    mcp_status = mcp_client.get_status()
-    if mcp_status == "connected":
-        logger.info("Google Calendar: connected via MCP.")
-    else:
-        logger.warning(
-            "Google Calendar: NOT connected (status=%s) - the app is using the local mock "
-            "calendar. This is fine locally; in production it means real calendar actions "
-            "won't happen. See README 'Google Calendar on Railway'.",
-            mcp_status,
-        )
-
-    if settings.gradio_auth is None:
-        logger.warning(
-            "GRADIO_AUTH_USER/GRADIO_AUTH_PASS not set - the app is running with NO login "
-            "gate and is fully open to anyone who can reach the URL. Set both env vars to "
-            "require a shared password."
-        )
-
-    with gr.Blocks(title="LifeOps Agent") as demo:
+    Kept separate from main() so app/web.py can mount the same UI inside its
+    FastAPI "Sign in with Google" wrapper, while main() still launches it
+    standalone for local single-user dev. Theme/CSS live on the Blocks so both
+    entrypoints render identically.
+    """
+    with gr.Blocks(title="LifeOps Agent", theme=gr.themes.Ocean(), css=_CUSTOM_CSS) as demo:
         gr.Markdown("# ✨ LifeOps Agent", elem_id="chat-title")
         gr.Markdown(
             "Type or record a message - e.g. *\"remind me to call mom tomorrow at 5pm\"*.",
@@ -212,11 +207,39 @@ def main() -> None:
 
         agent_reset_btn.click(fn=handle_agent_reset, outputs=[chat, session_state])
 
+    return demo
+
+
+def main() -> None:
+    # Standalone single-user launch for local dev. The multi-user "Sign in with
+    # Google" entrypoint is app/web.py (served via space_app.py). Side-effecting
+    # startup lives here, not at module level, so importing this module (e.g.
+    # from tests) never triggers it.
+    init_tracing()
+    init_db()
+    mcp_client.start()
+
+    mcp_status = mcp_client.get_status()
+    if mcp_status == "connected":
+        logger.info("Google Calendar: connected via MCP.")
+    else:
+        logger.warning(
+            "Google Calendar: NOT connected (status=%s) - the app is using the local mock "
+            "calendar. This is fine locally; in production it means real calendar actions "
+            "won't happen. See README 'Google Calendar on Railway'.",
+            mcp_status,
+        )
+
+    if settings.gradio_auth is None:
+        logger.warning(
+            "GRADIO_AUTH_USER/GRADIO_AUTH_PASS not set - the app is running with NO login "
+            "gate and is fully open to anyone who can reach the URL. Set both env vars to "
+            "require a shared password."
+        )
+
     # Railway (and most container hosts) assign a dynamic port via $PORT and
     # expect the app to bind 0.0.0.0, not localhost. Defaults match local dev.
-    demo.launch(
-        theme=gr.themes.Ocean(),
-        css=_CUSTOM_CSS,
+    build_demo().launch(
         server_name=os.environ.get("SERVER_NAME", "0.0.0.0"),
         server_port=int(os.environ.get("PORT", 7860)),
         auth=settings.gradio_auth,

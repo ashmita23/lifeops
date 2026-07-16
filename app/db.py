@@ -6,6 +6,17 @@ from contextlib import contextmanager
 from app.config import settings
 
 _SCHEMA = """
+-- One row per person who has signed in with Google. user_id is the Google
+-- account's stable `sub` claim (never the email, which can change). All
+-- per-user data (reminders, journal, calendar credentials) keys off this.
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    email TEXT,
+    name TEXT,
+    created_at TEXT NOT NULL,
+    last_login_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
