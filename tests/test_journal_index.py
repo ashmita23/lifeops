@@ -18,10 +18,14 @@ class FakeIndex:
         for id_, vec, meta in items:
             self.vectors[id_] = (list(vec), meta)
 
-    def query(self, vector, top_k, include_metadata=True):
+    def query(self, vector, top_k, include_metadata=True, filter=None):
+        # Honor the per-user metadata filter retrieve() sends, mirroring Pinecone.
+        wanted_user = (filter or {}).get("user_id", {}).get("$eq")
         q = np.asarray(vector, dtype=float)
         scored = []
         for id_, (vec, meta) in self.vectors.items():
+            if wanted_user is not None and meta.get("user_id") != wanted_user:
+                continue
             v = np.asarray(vec, dtype=float)
             sim = float(q @ v / (np.linalg.norm(q) * np.linalg.norm(v) + 1e-9))
             scored.append((sim, id_, meta))

@@ -47,6 +47,7 @@ from app.config import settings
 from langfuse import get_client, observe, propagate_attributes
 
 from app.budget import BudgetExceededError
+from app.db import user_scope
 from app.llm_client import LLMUnavailableError, call_llm_with_tools, session_scope
 from app.schemas import AgentTurnResult, ParsedIntent
 from app.services.summary import get_daily_summary
@@ -785,7 +786,10 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
 
 @observe(name="run_agent_turn", as_type="agent", capture_input=False, capture_output=False)
 def run_agent_turn(
-    session_id: str | None, input_text: str, timezone: str = "America/Chicago"
+    session_id: str | None,
+    input_text: str,
+    timezone: str = "America/Chicago",
+    user_id: str | None = None,
 ) -> AgentTurnResult:
     # Resolve the session id up front so every branch below (including the
     # demo-mode early return) can be tagged and grouped into the same
@@ -795,9 +799,11 @@ def run_agent_turn(
 
     # session_scope makes session_id available to call_llm_with_tools (for
     # per-session budget/usage) without adding it as a parameter that would
-    # break the mocked signature in tests. propagate_attributes groups the
-    # Langfuse trace by the same session.
-    with session_scope(session_id), propagate_attributes(session_id=session_id, trace_name="run_agent_turn"):
+    # break the mocked signature in tests. user_scope does the same for the
+    # signed-in user id so the per-user data tools (reminders, journal, RAG)
+    # scope their queries - None means single-user (DEFAULT_USER_ID).
+    # propagate_attributes groups the Langfuse trace by the same session.
+    with user_scope(user_id), session_scope(session_id), propagate_attributes(session_id=session_id, trace_name="run_agent_turn"):
         # Set explicit trace input/output instead of letting @observe capture
         # raw function args (which would include internal params like
         # timezone) - keep the trace readable and scoped to what matters.

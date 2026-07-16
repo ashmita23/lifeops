@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from app.db import connection_scope
+from app.db import connection_scope, current_user_id
 from app.schemas import ParsedIntent
 
 
@@ -16,10 +16,10 @@ def create_reminder(intent: ParsedIntent) -> dict:
     with connection_scope() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO reminders (title, description, due_date, priority, created_at, raw_text)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO reminders (user_id, title, description, due_date, priority, created_at, raw_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (title, description, due_date, priority, created_at, intent.raw_text),
+            (current_user_id(), title, description, due_date, priority, created_at, intent.raw_text),
         )
         record_id = cursor.lastrowid
 
@@ -36,13 +36,13 @@ def create_reminder(intent: ParsedIntent) -> dict:
 
 
 def list_reminders(include_completed: bool = False) -> list[dict]:
-    query = "SELECT * FROM reminders"
+    query = "SELECT * FROM reminders WHERE user_id = ?"
     if not include_completed:
-        query += " WHERE completed = 0"
+        query += " AND completed = 0"
     query += " ORDER BY due_date IS NULL, due_date ASC"
 
     with connection_scope() as conn:
-        rows = conn.execute(query).fetchall()
+        rows = conn.execute(query, (current_user_id(),)).fetchall()
 
     return [_row_to_dict(row) for row in rows]
 
@@ -62,29 +62,39 @@ def update_reminder(
     }
     fields = {key: value for key, value in fields.items() if value is not None}
 
+    uid = current_user_id()
     with connection_scope() as conn:
         if fields:
             set_clause = ", ".join(f"{key} = ?" for key in fields)
             conn.execute(
-                f"UPDATE reminders SET {set_clause} WHERE id = ?",
-                (*fields.values(), reminder_id),
+                f"UPDATE reminders SET {set_clause} WHERE id = ? AND user_id = ?",
+                (*fields.values(), reminder_id, uid),
             )
-        row = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, uid)
+        ).fetchone()
 
     return _row_to_dict(row) if row else None
 
 
 def complete_reminder(reminder_id: int) -> dict | None:
+    uid = current_user_id()
     with connection_scope() as conn:
-        conn.execute("UPDATE reminders SET completed = 1 WHERE id = ?", (reminder_id,))
-        row = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        conn.execute(
+            "UPDATE reminders SET completed = 1 WHERE id = ? AND user_id = ?", (reminder_id, uid)
+        )
+        row = conn.execute(
+            "SELECT * FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, uid)
+        ).fetchone()
 
     return _row_to_dict(row) if row else None
 
 
 def delete_reminder(reminder_id: int) -> bool:
     with connection_scope() as conn:
-        cursor = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+        cursor = conn.execute(
+            "DELETE FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, current_user_id())
+        )
 
     return cursor.rowcount > 0
 

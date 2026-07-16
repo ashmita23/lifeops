@@ -1,9 +1,35 @@
 """SQLite storage layer. Plain sqlite3, no ORM, to keep the MVP simple."""
 
+import contextvars
 import sqlite3
 from contextlib import contextmanager
 
 from app.config import settings
+
+# Bucket for data created when no one is signed in (single-user local dev / the
+# pre-multi-user rows). In multi-user mode the value is the Google `sub`.
+DEFAULT_USER_ID = "local"
+
+# Request-scoped current user, set by run_agent_turn via user_scope(). The
+# per-user data tools (reminders, journal, journal RAG) read current_user_id()
+# to scope their queries, so their call signatures - and the agent dispatchers
+# that call them - don't all have to thread user_id through by hand.
+_user_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("lifeops_user_id", default=None)
+
+
+@contextmanager
+def user_scope(user_id: str | None):
+    token = _user_ctx.set(user_id)
+    try:
+        yield
+    finally:
+        _user_ctx.reset(token)
+
+
+def current_user_id() -> str:
+    """The signed-in user's id for the current turn, or DEFAULT_USER_ID in
+    single-user mode. Every per-user row is created and read under this key."""
+    return _user_ctx.get() or DEFAULT_USER_ID
 
 _SCHEMA = """
 -- One row per person who has signed in with Google. user_id is the Google
@@ -30,6 +56,7 @@ CREATE TABLE IF NOT EXISTS google_credentials (
 
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT 'local',
     title TEXT NOT NULL,
     description TEXT,
     due_date TEXT,
@@ -39,8 +66,11 @@ CREATE TABLE IF NOT EXISTS reminders (
     raw_text TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders (user_id);
+
 CREATE TABLE IF NOT EXISTS journal_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL DEFAULT 'local',
     title TEXT,
     content TEXT NOT NULL,
     mood TEXT,
@@ -48,6 +78,8 @@ CREATE TABLE IF NOT EXISTS journal_entries (
     created_at TEXT NOT NULL,
     raw_text TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_journal_entries_user ON journal_entries (user_id);
 
 CREATE TABLE IF NOT EXISTS calendar_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +177,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reminders ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    # Multi-user scoping: add user_id to the two previously-global tables. The
+    # DEFAULT 'local' also backfills existing rows in one step, so a single-user
+    # DB's data lands in the DEFAULT_USER_ID bucket and keeps working.
+    for table in ("reminders", "journal_entries"):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     _migrate_conversations_to_rows(conn)
 

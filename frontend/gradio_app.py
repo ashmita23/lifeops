@@ -89,11 +89,10 @@ def handle_agent_submit(
     handler_start = time.perf_counter()
 
     # In multi-user mode app/web.py's auth_dependency puts the signed-in Google
-    # user id on gr.Request.username (None in single-user local dev). Captured
-    # here; Phase 3 threads it into run_agent_turn to scope data per user.
+    # user id on gr.Request.username (None in single-user local dev). Threaded
+    # into run_agent_turn below so per-user data (reminders, journal, RAG) is
+    # scoped to this user.
     user_id = getattr(request, "username", None) if request is not None else None
-    if user_id:
-        logger.debug("agent turn for user_id=%s", user_id)
 
     # The browser reports its own IANA timezone (see the demo.load JS hook);
     # fall back to a sane default if it's missing so relative dates like
@@ -121,7 +120,9 @@ def handle_agent_submit(
     usage_before = budget.get_usage(session_id) if session_id else {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
 
     agent_start = time.perf_counter()
-    result = run_agent_turn(session_id=session_id or None, input_text=text, timezone=timezone)
+    result = run_agent_turn(
+        session_id=session_id or None, input_text=text, timezone=timezone, user_id=user_id
+    )
     agent_latency_ms = (time.perf_counter() - agent_start) * 1000
 
     usage_after = budget.get_usage(result.session_id)
