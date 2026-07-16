@@ -178,22 +178,43 @@ first working locally but miss the second:
    silently fall back to the local mock tool every time - there's no token
    for it to use.
 
-To fix this, generate the token once locally, then carry it over:
+First, generate the token once locally:
 
-1. Run the app locally with `GOOGLE_OAUTH_CREDENTIALS_PATH` set and
-   complete the browser consent flow once (you'll see "Tokens updated and
-   saved" in the logs). Find the resulting token file - by default
-   `~/.config/google-calendar-mcp/tokens.json` on macOS/Linux.
-2. Upload both the credentials JSON and that `tokens.json` onto the same
-   persistent Railway volume you set up for the database (e.g. as
-   `/data/gcp-oauth.keys.json` and `/data/gcp-tokens.json` - Railway's
-   dashboard lets you open a shell on the volume, or you can `scp`/`railway
-   run` a copy).
-3. Set `GOOGLE_OAUTH_CREDENTIALS_PATH=/data/gcp-oauth.keys.json` and
-   `GOOGLE_CALENDAR_MCP_TOKEN_PATH=/data/gcp-tokens.json` in the service's
-   environment variables.
+- Run the app locally with `GOOGLE_OAUTH_CREDENTIALS_PATH` set and complete
+  the browser consent flow once (you'll see "Tokens updated and saved" in
+  the logs). Find the resulting token file - by default
+  `~/.config/google-calendar-mcp/tokens.json` on macOS/Linux.
+- Make sure the token is long-lived: if your Google OAuth app is still in
+  **Testing** mode, its refresh token expires after **7 days**. Publish the
+  app (Google Auth Platform -> Audience -> "Publish app" / In production),
+  then delete `tokens.json` and re-run the consent flow so a fresh,
+  non-expiring token is issued (the `refresh_token_expires_in` field
+  disappears once it's long-lived).
 
-**Never commit either of these files to git** - `tokens.json` contains a
-live refresh token for your real calendar. Both stay off the volume's
-public surface and out of the repo entirely; they only need to exist on
-the Railway volume itself.
+Then carry both files over to Railway, either way:
+
+**Option A - environment variables (no volume shell needed).** Set two env
+vars on the service to the *contents* of the two files, and the app writes
+them back to real files on startup (see
+`app/mcp_client.py::_materialize_google_secrets_from_env`):
+
+- `GOOGLE_OAUTH_CREDENTIALS_JSON` = the full contents of your
+  `gcp-oauth-keys.json`
+- `GOOGLE_CALENDAR_MCP_TOKEN_JSON` = the full contents of your `tokens.json`
+
+The files are written next to `DATABASE_PATH`, so pointing `DATABASE_PATH`
+at a persistent volume (e.g. `/data/lifeops.db`) lets the refreshed token
+survive redeploys. No `GOOGLE_OAUTH_CREDENTIALS_PATH` /
+`GOOGLE_CALENDAR_MCP_TOKEN_PATH` needed - the app sets those itself.
+
+**Option B - upload the files to the volume directly.** Put both files on
+the same persistent volume as the database (e.g. `/data/gcp-oauth.keys.json`
+and `/data/gcp-tokens.json` - Railway's dashboard lets you open a shell, or
+`scp`/`railway run` a copy), then set
+`GOOGLE_OAUTH_CREDENTIALS_PATH=/data/gcp-oauth.keys.json` and
+`GOOGLE_CALENDAR_MCP_TOKEN_PATH=/data/gcp-tokens.json`.
+
+**Never commit either file to git** - `tokens.json` contains a live refresh
+token for your real calendar. With Option A the secrets live only in
+Railway's env-var store; with Option B, only on the volume. Either way they
+stay out of the repo entirely.

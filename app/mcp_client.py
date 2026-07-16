@@ -16,7 +16,9 @@ just its local tools.
 
 import asyncio
 import logging
+import os
 import threading
+from pathlib import Path
 
 # app.config must be imported (and its load_dotenv() run) before langfuse,
 # or Langfuse may initialize its singleton client with missing credentials.
@@ -47,6 +49,50 @@ _status: str = "not_configured"
 def get_status() -> str:
     """Current Google Calendar MCP connection status (see _status)."""
     return _status
+
+
+def _materialize_google_secrets_from_env() -> None:
+    """Recreate the Google Calendar credential + token files from env vars.
+
+    A headless host like Railway has no browser to run Google's interactive
+    OAuth consent flow and no easy way to hand-place files on its disk. So we
+    let the two files ride in as environment variables and write them back to
+    real files here at startup, pointing the path settings at them:
+
+      GOOGLE_OAUTH_CREDENTIALS_JSON   -> the OAuth client credentials JSON
+      GOOGLE_CALENDAR_MCP_TOKEN_JSON  -> the token minted by the local `auth` run
+
+    Files are written next to DATABASE_PATH, so when DATABASE_PATH is on a
+    persistent Railway volume the token the MCP server refreshes at runtime
+    survives redeploys. The token is only written when absent, so a live token
+    already maintained on the volume is never clobbered by the (older) seed;
+    the credentials file is static, so it's always refreshed. A no-op when
+    neither env var is set - local dev keeps using the files it already has."""
+    creds_json = os.environ.get("GOOGLE_OAUTH_CREDENTIALS_JSON")
+    token_json = os.environ.get("GOOGLE_CALENDAR_MCP_TOKEN_JSON")
+    if not creds_json and not token_json:
+        return
+
+    db_path = Path(settings.database_path)
+    base = db_path.parent if db_path.is_absolute() else Path.cwd()
+    base.mkdir(parents=True, exist_ok=True)
+
+    if creds_json:
+        creds_path = base / "gcp-oauth.keys.json"
+        creds_path.write_text(creds_json)
+        creds_path.chmod(0o600)
+        settings.google_oauth_credentials_path = str(creds_path)
+        logger.info("Wrote Google OAuth credentials from env to %s.", creds_path)
+
+    if token_json:
+        token_path = base / "gcp-tokens.json"
+        if token_path.exists():
+            logger.info("Google Calendar token already present at %s; keeping it.", token_path)
+        else:
+            token_path.write_text(token_json)
+            token_path.chmod(0o600)
+            logger.info("Wrote Google Calendar token from env to %s.", token_path)
+        settings.google_calendar_mcp_token_path = str(token_path)
 
 
 def _server_params() -> StdioServerParameters | None:
@@ -115,6 +161,8 @@ def start() -> None:
 
     if _loop is not None:
         return
+
+    _materialize_google_secrets_from_env()
 
     _loop = asyncio.new_event_loop()
     _thread = threading.Thread(target=_run_loop, args=(_loop,), daemon=True)
