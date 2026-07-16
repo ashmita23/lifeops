@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import auth, mcp_client
+from app import auth, mcp_client, tokens
 from app.config import settings
 from app.db import init_db
 from app.tracing import init_tracing
@@ -99,8 +99,8 @@ def create_app() -> FastAPI:
         if not code:
             return JSONResponse({"error": "missing code"}, status_code=400)
 
-        tokens = await auth.exchange_code(code)
-        info = await auth.fetch_userinfo(tokens["access_token"])
+        tokens_resp = await auth.exchange_code(code)
+        info = await auth.fetch_userinfo(tokens_resp["access_token"])
         user_id = info["sub"]
         auth.upsert_user(user_id, info.get("email"), info.get("name"))
         request.session["user"] = {
@@ -108,7 +108,9 @@ def create_app() -> FastAPI:
             "email": info.get("email"),
             "name": info.get("name"),
         }
-        # Phase 2 stores tokens["refresh_token"] (encrypted) here.
+        # Persist the (encrypted) refresh token so we can act on this user's
+        # own calendar later (app/tokens.py, used from Phase 4).
+        tokens.store_credentials(user_id, tokens_resp.get("refresh_token"), tokens_resp.get("scope"))
         logger.info("User signed in: %s", info.get("email"))
         return RedirectResponse("/")
 

@@ -17,6 +17,17 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TEXT
 );
 
+-- A user's Google Calendar grant. refresh_token is a long-lived secret and is
+-- stored ENCRYPTED (Fernet) - see app/tokens.py. One row per user; replaced on
+-- re-consent. Kept separate from `users` so a user can exist (signed in) with
+-- no calendar connected, and so the secret table can be locked down on its own.
+CREATE TABLE IF NOT EXISTS google_credentials (
+    user_id TEXT PRIMARY KEY,
+    refresh_token TEXT NOT NULL,
+    scope TEXT,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
