@@ -125,26 +125,41 @@ body { background: transparent !important; }
     to { opacity: 1; transform: translateY(0); }
 }
 
-/* Input: glowing dark pill */
+/* Message action buttons (copy / like / retry) rendered as white boxes by the
+   light theme - make them blend into the dark chat: transparent, faint icons. */
+#lifeops-chatbot button {
+    background: transparent !important;
+    border: none !important;
+    box-shadow: none !important;
+}
+#lifeops-chatbot .message-buttons, #lifeops-chatbot .icon-button-wrapper {
+    background: transparent !important; border: none !important;
+}
+#lifeops-chatbot button svg { color: rgba(255, 255, 255, 0.55) !important; opacity: 0.75; }
+#lifeops-chatbot button:hover svg { opacity: 1; }
+
+/* Input: clean white pill with black text (readable on the dark ground) */
 #lifeops-input {
     border-radius: 999px !important;
-    background: rgba(15, 16, 28, 0.6) !important;
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
-    border: 1px solid rgba(255, 255, 255, 0.14) !important;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
-    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    background: rgba(255, 255, 255, 0.97) !important;
+    border: 1px solid rgba(255, 255, 255, 0.5) !important;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+    transition: box-shadow 0.2s ease;
 }
 #lifeops-input:focus-within {
-    border-color: rgba(155, 120, 255, 0.7) !important;
-    box-shadow: 0 0 0 3px rgba(120, 90, 255, 0.25), 0 10px 40px rgba(0, 0, 0, 0.5);
+    box-shadow: 0 0 0 3px rgba(120, 90, 255, 0.4), 0 10px 40px rgba(0, 0, 0, 0.45);
 }
-#lifeops-input textarea {
+/* Inner Gradio wrappers transparent so the white pill is one clean surface. */
+#lifeops-input .block, #lifeops-input .wrap, #lifeops-input .form,
+#lifeops-input [class*="container"] { background: transparent !important; border: none !important; }
+#lifeops-input textarea, #lifeops-input input[type="text"] {
     background: transparent !important;
-    color: #f3f4f8 !important;
+    color: #15151d !important;
     border-radius: 999px !important;
 }
-#lifeops-input textarea::placeholder { color: rgba(255, 255, 255, 0.5) !important; }
+#lifeops-input textarea::placeholder { color: rgba(0, 0, 0, 0.42) !important; }
+/* Icons inside the input (mic/attach/send) stay dark on the white pill. */
+#lifeops-input svg { color: #3a3a46 !important; }
 
 /* Reset button: subtle glass pill */
 #lifeops-reset {
