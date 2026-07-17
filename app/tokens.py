@@ -90,10 +90,11 @@ class CalendarAuthError(Exception):
     (revoked / expired). Callers should prompt the user to reconnect."""
 
 
-async def get_access_token(user_id: str) -> str:
+def get_access_token(user_id: str) -> str:
     """Mint a fresh short-lived access token from the user's stored refresh
-    token. Raises CalendarAuthError if there's nothing stored or Google refuses
-    (e.g. the user revoked access)."""
+    token. Synchronous: called from the agent's (sync) tool dispatch. Raises
+    CalendarAuthError if there's nothing stored or Google refuses (e.g. the
+    user revoked access)."""
     refresh_token = get_refresh_token(user_id)
     if not refresh_token:
         raise CalendarAuthError(f"No calendar credentials stored for user {user_id}.")
@@ -103,8 +104,8 @@ async def get_access_token(user_id: str) -> str:
         "refresh_token": refresh_token,
         "grant_type": "refresh_token",
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(_TOKEN_ENDPOINT, data=data)
+    with httpx.Client(timeout=30) as client:
+        resp = client.post(_TOKEN_ENDPOINT, data=data)
     if resp.status_code != 200:
         raise CalendarAuthError(
             f"Google refused to refresh the token for user {user_id}: "

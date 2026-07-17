@@ -63,10 +63,12 @@ async def _require_login(request: Request, call_next):
 def create_app() -> FastAPI:
     init_tracing()
     init_db()
-    # Global single-user MCP calendar still runs (phases 1-3 keep using it);
-    # per-user real calendars replace it in Phase 4. Harmless no-op when the
-    # calendar isn't configured.
-    mcp_client.start()
+    # In multi-user mode every signed-in user acts on their OWN calendar
+    # (app/google_calendar.py), so we don't start the single global MCP
+    # calendar at all - and Railway needs no owner calendar token. Single-user
+    # mode still uses the MCP calendar.
+    if not settings.google_login_enabled:
+        mcp_client.start()
 
     app = FastAPI()
     demo = build_demo()

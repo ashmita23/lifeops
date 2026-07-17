@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 # app.config must be imported (and its load_dotenv() run) before langfuse,
 # or Langfuse may initialize its singleton client with missing credentials.
-from app import guardrails, journal_index, mcp_client, session_store
+from app import google_calendar, guardrails, journal_index, mcp_client, session_store, tokens
 from app.config import settings
 
 from langfuse import get_client, observe, propagate_attributes
@@ -666,24 +666,42 @@ def _final_text(messages: list[dict], tools: list[dict], reason: str) -> str:
     return final_text
 
 
+def _user_calendar_active() -> bool:
+    """True when the signed-in user has their own Google Calendar connected, so
+    the agent should act on THEIR calendar (app/google_calendar.py) rather than
+    the single global MCP calendar. Decided here and in dispatch off the same
+    condition so the offered tools and the executor never disagree."""
+    from app.db import current_user_id
+
+    return settings.google_login_enabled and tokens.has_calendar_credentials(current_user_id())
+
+
 def _build_tools(include_confirm_tool: bool) -> tuple[list[dict], bool]:
-    """Merges local tools with whatever the Google Calendar MCP server
-    exposes (if connected). Returns (tools, mcp_active).
+    """Merges local tools with the active calendar backend's tools. Returns
+    (tools, calendar_active).
+
+    Calendar backend, in priority order:
+      1. the signed-in user's own Google Calendar (multi-user), or
+      2. the single global Google Calendar MCP server (single-user), or
+      3. none -> the local mock calendar tools stay in the list.
 
     include_confirm_tool: only offer CONFIRM_TOOL_NAME when there's an
     actual pending confirmation for this session - otherwise it's a
     meaningless option that could confuse the model into calling it
     without cause."""
-    mcp_tools = mcp_client.get_mcp_tools()
-    mcp_active = bool(mcp_tools)
+    if _user_calendar_active():
+        calendar_tools = google_calendar.CALENDAR_TOOLS
+    else:
+        calendar_tools = mcp_client.get_mcp_tools()
+    calendar_active = bool(calendar_tools)
 
     local_tools = _LOCAL_TOOLS
-    if mcp_active:
+    if calendar_active:
         local_tools = [
             tool for tool in _LOCAL_TOOLS if tool["function"]["name"] not in _LOCAL_CALENDAR_TOOL_NAMES
         ]
 
-    tools = local_tools + mcp_tools
+    tools = local_tools + calendar_tools
 
     if include_confirm_tool:
         # While an action is pending confirmation, hide ALL approval-required
@@ -694,10 +712,10 @@ def _build_tools(include_confirm_tool: bool) -> tuple[list[dict], bool]:
         tools = [t for t in tools if not _requires_approval(t["function"]["name"])]
         tools = tools + [_CONFIRM_TOOL]
 
-    return tools, mcp_active
+    return tools, calendar_active
 
 
-def _system_prompt(timezone: str, mcp_active: bool) -> str:
+def _system_prompt(timezone: str, calendar_active: bool) -> str:
     try:
         tz = ZoneInfo(timezone)
     except Exception:
@@ -737,7 +755,7 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
         "asked about availability, reason over the returned events/reminders instead of "
         "just repeating them.\n\n"
         "You can also list, update, complete, and delete reminders"
-        + (" and journal entries." if mcp_active else ", calendar events, and journal entries.")
+        + (" and journal entries." if calendar_active else ", calendar events, and journal entries.")
         + " If the user refers to something without a known "
         "id (e.g. 'delete my dentist reminder', 'mark the tax thing done'), call the "
         "matching list tool first to find its id before acting on it. Always confirm "
@@ -777,7 +795,7 @@ def _system_prompt(timezone: str, mcp_active: bool) -> str:
             "more broadly (e.g. all events in the relevant date range) before telling the "
             "user nothing was found, since titles are often worded differently than how the "
             "user refers to them in conversation."
-            if mcp_active
+            if calendar_active
             else "\n\nCalendar events are currently stored locally only (no real Google "
             "Calendar connected yet)."
         )
@@ -927,6 +945,8 @@ def _process_confirmation(state: _TurnState, call, args: dict) -> _Outcome:
     tool_args = state.pending_before["arguments"]
     if tool_name in TOOL_DISPATCH:
         record = _execute_local_tool(tool_name, tool_args, state.input_text)
+    elif _user_calendar_active() and google_calendar.is_calendar_tool(tool_name):
+        record = google_calendar.call_calendar_tool(tool_name, tool_args)
     else:
         record = mcp_client.call_mcp_tool(tool_name, tool_args)
 
@@ -965,10 +985,19 @@ def _process_one_call(state: _TurnState, call) -> _Outcome:
     if tool_name == CONFIRM_TOOL_NAME:
         return _process_confirmation(state, call, args)
 
+    # Calendar routing mirrors _build_tools: if the signed-in user has their own
+    # calendar connected, calendar tool calls execute against THEIR calendar;
+    # otherwise they fall through to the global MCP calendar.
+    user_calendar = _user_calendar_active()
     is_known_local = tool_name in TOOL_DISPATCH
-    is_known_mcp = not is_known_local and mcp_client.is_mcp_tool(tool_name)
+    is_known_user_calendar = (
+        not is_known_local and user_calendar and google_calendar.is_calendar_tool(tool_name)
+    )
+    is_known_mcp = (
+        not is_known_local and not user_calendar and mcp_client.is_mcp_tool(tool_name)
+    )
 
-    if not is_known_local and not is_known_mcp:
+    if not is_known_local and not is_known_user_calendar and not is_known_mcp:
         state.actions.append(
             {"tool": tool_name, "arguments": args, "status": "error", "result": None, "error": "unknown tool"}
         )
@@ -987,6 +1016,8 @@ def _process_one_call(state: _TurnState, call) -> _Outcome:
 
     if is_known_local:
         record = _execute_local_tool(tool_name, args, state.input_text)
+    elif is_known_user_calendar:
+        record = google_calendar.call_calendar_tool(tool_name, args)
     else:
         record = mcp_client.call_mcp_tool(tool_name, args)
     state.append_tool_result(call.id, record)
@@ -1055,13 +1086,13 @@ def _run_agent_turn_body(session_id: str, input_text: str, timezone: str) -> Age
     # state is gone - it never lingers past one follow-up turn.
     pending_before = session_store.pop_pending_confirmation(session_id)
 
-    tools, mcp_active = _build_tools(include_confirm_tool=pending_before is not None)
+    tools, calendar_active = _build_tools(include_confirm_tool=pending_before is not None)
 
     messages = session_store.get_session_messages(session_id)
     if messages is None:
         # Brand-new session: the system message is freshly built and NOT yet
         # persisted, so persisted_count is 0 - finish() must write it too.
-        messages = [{"role": "system", "content": _system_prompt(timezone, mcp_active)}]
+        messages = [{"role": "system", "content": _system_prompt(timezone, calendar_active)}]
         persisted_count = 0
     else:
         # Loaded from the append-only log: every row is already durable, so
