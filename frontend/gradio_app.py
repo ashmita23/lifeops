@@ -40,41 +40,113 @@ def _export_trace_background(trace_id: str | None, expected_latency_seconds: flo
     elapsed_ms = (time.perf_counter() - start) * 1000
     logger.info("trace_export_latency_ms=%.1f trace_id=%s path=%s", elapsed_ms, trace_id, path)
 
+# Applied at launch()/mount time (Gradio 6.0 no longer takes these on Blocks).
+UI_THEME = gr.themes.Ocean()
+
 _CUSTOM_CSS = """
-.gradio-container {
-    max-width: 760px !important;
-    margin: 0 auto !important;
+:root { color-scheme: dark; }
+
+/* Full-viewport Lovable-style gradient behind everything (navy -> blue ->
+   magenta -> warm), pinned so it doesn't scroll. */
+body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background: linear-gradient(180deg,
+        #0a0a12 0%, #0f1a4d 20%, #3a2a8f 42%,
+        #9c3a86 62%, #e0568f 80%, #f2743f 100%);
 }
+body { background: transparent !important; }
+
+.gradio-container {
+    max-width: 820px !important;
+    margin: 0 auto !important;
+    background: transparent !important;
+}
+/* Let the gradient show through Gradio's inner panels. */
+.gradio-container .main, .gradio-container .wrap, .gradio-container .panel,
+.gradio-container .form, .gradio-container .block, .gradio-container .gap,
+.gradio-container .container, gradio-app { background: transparent !important; }
+
 #chat-title {
     text-align: center;
     margin-bottom: 0 !important;
+    font-weight: 800 !important;
+    font-size: 2.4rem !important;
+    letter-spacing: -0.02em;
+    color: #ffffff !important;
+    text-shadow: 0 2px 30px rgba(0, 0, 0, 0.35);
 }
 #chat-subtitle {
     text-align: center;
-    opacity: 0.7;
-    margin-top: 0 !important;
-    margin-bottom: 1.25rem !important;
+    color: rgba(255, 255, 255, 0.75) !important;
+    margin-top: 0.4rem !important;
+    margin-bottom: 1.5rem !important;
 }
+
+/* Chat surface: dark frosted glass */
 #lifeops-chatbot {
-    border-radius: 18px !important;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+    border-radius: 22px !important;
+    background: rgba(15, 16, 28, 0.55) !important;
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    border: 1px solid rgba(255, 255, 255, 0.12) !important;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45) !important;
 }
-#lifeops-chatbot .message {
+#lifeops-chatbot, #lifeops-chatbot * { color: #f3f4f8 !important; }
+#lifeops-chatbot sub { color: rgba(255, 255, 255, 0.5) !important; }
+
+#lifeops-chatbot .message, #lifeops-chatbot .bubble {
     animation: lifeops-fade-in 0.25s ease-out;
+    border-radius: 16px !important;
+}
+/* User bubble: accent gradient. Assistant bubble: subtle glass. */
+#lifeops-chatbot .user, #lifeops-chatbot [data-testid="user"] {
+    background: linear-gradient(135deg, #6d5cff, #c14ba0) !important;
+    border: none !important;
+}
+#lifeops-chatbot .bot, #lifeops-chatbot [data-testid="bot"] {
+    background: rgba(255, 255, 255, 0.06) !important;
 }
 @keyframes lifeops-fade-in {
     from { opacity: 0; transform: translateY(4px); }
     to { opacity: 1; transform: translateY(0); }
 }
+
+/* Input: glowing dark pill */
+#lifeops-input {
+    border-radius: 999px !important;
+    background: rgba(15, 16, 28, 0.6) !important;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+#lifeops-input:focus-within {
+    border-color: rgba(155, 120, 255, 0.7) !important;
+    box-shadow: 0 0 0 3px rgba(120, 90, 255, 0.25), 0 10px 40px rgba(0, 0, 0, 0.5);
+}
 #lifeops-input textarea {
+    background: transparent !important;
+    color: #f3f4f8 !important;
     border-radius: 999px !important;
 }
+#lifeops-input textarea::placeholder { color: rgba(255, 255, 255, 0.5) !important; }
+
+/* Reset button: subtle glass pill */
 #lifeops-reset {
-    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    border-radius: 999px !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    border: 1px solid rgba(255, 255, 255, 0.16) !important;
+    color: #ffffff !important;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
 }
 #lifeops-reset:hover {
     transform: translateY(-1px);
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+    background: rgba(255, 255, 255, 0.14) !important;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
 """
 
@@ -171,7 +243,10 @@ def build_demo() -> gr.Blocks:
     standalone for local single-user dev. Theme/CSS live on the Blocks so both
     entrypoints render identically.
     """
-    with gr.Blocks(title="LifeOps Agent", theme=gr.themes.Ocean(), css=_CUSTOM_CSS) as demo:
+    # NOTE: theme/css are NOT passed here - Gradio 6.0 moved them off the Blocks
+    # constructor to launch()/mount_gradio_app(). They're applied by main() and
+    # by app/web.py's mount instead (see UI_THEME / _CUSTOM_CSS).
+    with gr.Blocks(title="LifeOps Agent") as demo:
         gr.Markdown("# ✨ LifeOps Agent", elem_id="chat-title")
         gr.Markdown(
             "Type or record a message - e.g. *\"remind me to call mom tomorrow at 5pm\"*.",
@@ -241,6 +316,8 @@ def main() -> None:
     # Railway (and most container hosts) assign a dynamic port via $PORT and
     # expect the app to bind 0.0.0.0, not localhost. Defaults match local dev.
     build_demo().launch(
+        theme=UI_THEME,
+        css=_CUSTOM_CSS,
         server_name=os.environ.get("SERVER_NAME", "0.0.0.0"),
         server_port=int(os.environ.get("PORT", 7860)),
         auth=settings.gradio_auth,

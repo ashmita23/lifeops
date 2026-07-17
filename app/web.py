@@ -28,7 +28,7 @@ from app import auth, mcp_client, tokens
 from app.config import settings
 from app.db import init_db
 from app.tracing import init_tracing
-from frontend.gradio_app import build_demo
+from frontend.gradio_app import UI_THEME, _CUSTOM_CSS, build_demo
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def create_app() -> FastAPI:
             "GOOGLE_OAUTH_CLIENT_ID/SECRET not set - running single-user with NO login. "
             "Set them (a Web OAuth client) to enable per-user 'Sign in with Google'."
         )
-        gr.mount_gradio_app(app, demo, path="/")
+        gr.mount_gradio_app(app, demo, path="/", theme=UI_THEME, css=_CUSTOM_CSS)
         return app
 
     @app.get("/login")
@@ -126,5 +126,7 @@ def create_app() -> FastAPI:
     # request.session before _require_login (and the routes) read it.
     app.add_middleware(SessionMiddleware, secret_key=settings.session_secret, same_site="lax")
 
-    gr.mount_gradio_app(app, demo, path="/", auth_dependency=_session_user_id)
+    gr.mount_gradio_app(
+        app, demo, path="/", auth_dependency=_session_user_id, theme=UI_THEME, css=_CUSTOM_CSS
+    )
     return app
