@@ -218,3 +218,41 @@ and `/data/gcp-tokens.json` - Railway's dashboard lets you open a shell, or
 token for your real calendar. With Option A the secrets live only in
 Railway's env-var store; with Option B, only on the volume. Either way they
 stay out of the repo entirely.
+
+### Multi-user: "Sign in with Google"
+
+By default the app is **single-user**: one shared password (or none), one
+calendar. Set the four `GOOGLE_OAUTH_CLIENT_ID/SECRET`, `SESSION_SECRET`,
+`TOKEN_ENCRYPTION_KEY` variables (see `.env.example`) to switch it into
+**multi-user** mode instead:
+
+- Every visitor signs in with their own Google account (app/web.py wraps the
+  Gradio UI in a FastAPI OAuth login; unauthenticated requests redirect to
+  `/login`).
+- Reminders, journal entries, and calendar all become per-user - each person
+  acts on their **own** Google Calendar (app/google_calendar.py), not a shared
+  one. The single global MCP calendar is not started in this mode.
+
+Setup:
+
+1. **Create a Web application OAuth client** in Google Cloud Console
+   (Credentials -> Create client -> Web application). This is separate from the
+   Desktop client the single-user MCP calendar uses.
+2. **Register redirect URIs** on it: `http://localhost:7860/oauth2callback`
+   for local dev and `https://<your-railway-domain>/oauth2callback` for
+   production. `OAUTH_REDIRECT_URI` must match the one in use.
+3. **Set the variables** on the Railway service:
+   `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+   `OAUTH_REDIRECT_URI=https://<your-railway-domain>/oauth2callback`,
+   `SESSION_SECRET`, `TOKEN_ENCRYPTION_KEY` (generate the last two per the
+   commands in `.env.example`). Point `DATABASE_PATH` at a persistent volume so
+   users and their encrypted tokens survive redeploys.
+4. **Authorize your users.** The Google *sensitive* calendar scope means the
+   app must be verified before the general public can use it. Until then, add
+   each person under Google Auth Platform -> Audience -> **Test users** (up to
+   100). They'll see a one-time "Google hasn't verified this app" screen
+   (Advanced -> continue) - expected for an unverified app.
+
+Refresh tokens are stored **encrypted** (Fernet) in the `google_credentials`
+table; never commit real secrets. A user can sign out (`/logout`) or, if their
+token is revoked, the app asks them to reconnect by signing in again.

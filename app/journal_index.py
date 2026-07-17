@@ -51,12 +51,15 @@ def _get_index():
 
 def index_entry(entry_id: int, text: str) -> None:
     """Embed and upsert one journal entry. No-op if RAG is unavailable. Upsert
-    keyed by id, so re-indexing the same entry is idempotent."""
+    keyed by id, so re-indexing the same entry is idempotent. Tags the vector
+    with the current user so retrieve() can filter to that user's entries."""
+    from app.db import current_user_id
+
     index = _get_index()
     if index is None or not text:
         return
     vector = embed_query(text)
-    index.upsert([(str(entry_id), vector, {"content": text})])
+    index.upsert([(str(entry_id), vector, {"content": text, "user_id": current_user_id()})])
 
 
 def backfill(entries: list[dict]) -> int:
@@ -78,11 +81,18 @@ def retrieve(query: str, k: int = 5) -> list[dict]:
     {id, content, score}. Returns [] immediately when RAG is unavailable -
     importantly BEFORE any embedding call, so offline tests never hit the
     network."""
+    from app.db import current_user_id
+
     index = _get_index()
     if index is None or not query:
         return []
     vector = embed_query(query)
-    result = index.query(vector=vector, top_k=k, include_metadata=True)
+    # Filter to the current user's own entries so RAG never surfaces another
+    # user's journal.
+    result = index.query(
+        vector=vector, top_k=k, include_metadata=True,
+        filter={"user_id": {"$eq": current_user_id()}},
+    )
     matches = result.get("matches", []) if isinstance(result, dict) else getattr(result, "matches", [])
     out = []
     for m in matches:

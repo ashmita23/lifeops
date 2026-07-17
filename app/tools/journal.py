@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from app.db import connection_scope
+from app.db import connection_scope, current_user_id
 from app.schemas import ParsedIntent
 
 
@@ -18,10 +18,10 @@ def create_journal_entry(intent: ParsedIntent) -> dict:
     with connection_scope() as conn:
         cursor = conn.execute(
             """
-            INSERT INTO journal_entries (title, content, mood, tags, created_at, raw_text)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO journal_entries (user_id, title, content, mood, tags, created_at, raw_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (title, content, mood, tags, created_at, intent.raw_text),
+            (current_user_id(), title, content, mood, tags, created_at, intent.raw_text),
         )
         record_id = cursor.lastrowid
 
@@ -38,13 +38,19 @@ def create_journal_entry(intent: ParsedIntent) -> dict:
 
 def list_journal_entries() -> list[dict]:
     with connection_scope() as conn:
-        rows = conn.execute("SELECT * FROM journal_entries ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM journal_entries WHERE user_id = ? ORDER BY created_at DESC",
+            (current_user_id(),),
+        ).fetchall()
 
     return [dict(row) for row in rows]
 
 
 def delete_journal_entry(entry_id: int) -> bool:
     with connection_scope() as conn:
-        cursor = conn.execute("DELETE FROM journal_entries WHERE id = ?", (entry_id,))
+        cursor = conn.execute(
+            "DELETE FROM journal_entries WHERE id = ? AND user_id = ?",
+            (entry_id, current_user_id()),
+        )
 
     return cursor.rowcount > 0
