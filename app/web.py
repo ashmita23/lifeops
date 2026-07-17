@@ -94,8 +94,22 @@ def create_app() -> FastAPI:
 
     @app.get("/oauth2callback")
     async def oauth2callback(request: Request):
-        if request.query_params.get("state") != request.session.get("oauth_state"):
-            return JSONResponse({"error": "state mismatch"}, status_code=400)
+        stored_state = request.session.get("oauth_state")
+        if request.query_params.get("state") != stored_state:
+            # session_had_state=False => the login session cookie never came
+            # back (usually opening the app at a different host than
+            # OAUTH_REDIRECT_URI, e.g. 127.0.0.1 vs localhost, or a blocked
+            # third-party cookie). =True but different => a stale/retried login.
+            logger.warning(
+                "OAuth state mismatch (session_had_state=%s). Likely the login session cookie "
+                "was lost - open the app at the SAME host as OAUTH_REDIRECT_URI (%s).",
+                bool(stored_state), settings.oauth_redirect_uri,
+            )
+            return JSONResponse(
+                {"error": "Login session was lost. Open the app at the same host as your redirect "
+                          "URI (e.g. http://localhost:7860, not 127.0.0.1), use a fresh tab, and try again."},
+                status_code=400,
+            )
         request.session.pop("oauth_state", None)
         code = request.query_params.get("code")
         if not code:
