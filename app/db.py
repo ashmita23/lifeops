@@ -66,8 +66,6 @@ CREATE TABLE IF NOT EXISTS reminders (
     raw_text TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders (user_id);
-
 CREATE TABLE IF NOT EXISTS journal_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL DEFAULT 'local',
@@ -78,8 +76,6 @@ CREATE TABLE IF NOT EXISTS journal_entries (
     created_at TEXT NOT NULL,
     raw_text TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_journal_entries_user ON journal_entries (user_id);
 
 CREATE TABLE IF NOT EXISTS calendar_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,6 +182,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local'")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # Indexes created here (not in _SCHEMA) so the user_id column is guaranteed
+    # to exist first - on a pre-existing DB the column is added by the ALTER
+    # above, which runs after _SCHEMA's CREATE TABLE IF NOT EXISTS no-ops.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders (user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_user ON journal_entries (user_id)")
 
     _migrate_conversations_to_rows(conn)
 
