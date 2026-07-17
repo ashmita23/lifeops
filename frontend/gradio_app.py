@@ -10,7 +10,7 @@ import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import budget, mcp_client
+from app import auth, budget, mcp_client
 from app.agent import run_agent_turn
 from app.config import settings
 from app.db import init_db
@@ -82,8 +82,19 @@ body { background: transparent !important; }
     text-align: center;
     color: rgba(255, 255, 255, 0.75) !important;
     margin-top: 0.4rem !important;
-    margin-bottom: 1.5rem !important;
+    margin-bottom: 1rem !important;
 }
+
+/* "Signed in as … · Sign out" strip */
+#lifeops-account { margin: 0 0 1rem !important; }
+#lifeops-account .account-inner {
+    text-align: right;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.7);
+}
+#lifeops-account b { color: #ffffff; font-weight: 600; }
+#lifeops-account a { color: #c9b6ff; text-decoration: none; }
+#lifeops-account a:hover { text-decoration: underline; }
 
 /* Chat surface: dark frosted glass */
 #lifeops-chatbot {
@@ -235,6 +246,21 @@ def handle_agent_reset():
     return [], ""
 
 
+def _account_bar(request: gr.Request | None = None) -> str:
+    """The 'Signed in as … · Sign out' strip. Populated per page load from the
+    logged-in user (multi-user mode); empty in single-user local dev, where
+    there's no account and /logout doesn't exist."""
+    user_id = getattr(request, "username", None) if request is not None else None
+    if not user_id:
+        return ""
+    user = auth.get_user(user_id) or {}
+    label = user.get("email") or user.get("name") or "your account"
+    return (
+        f'<div class="account-inner">Signed in as <b>{label}</b>'
+        f' &nbsp;·&nbsp; <a href="/logout">Sign out</a></div>'
+    )
+
+
 def build_demo() -> gr.Blocks:
     """Construct the Gradio UI (no side effects, no server started).
 
@@ -252,6 +278,12 @@ def build_demo() -> gr.Blocks:
             "Type or record a message - e.g. *\"remind me to call mom tomorrow at 5pm\"*.",
             elem_id="chat-subtitle",
         )
+
+        # "Signed in as … · Sign out" strip, only in multi-user mode. Filled on
+        # load (below) from the logged-in user.
+        account_bar = None
+        if settings.google_login_enabled:
+            account_bar = gr.HTML("", elem_id="lifeops-account")
 
         session_state = gr.State("")
         # Hidden field the browser fills with its own IANA timezone on load,
@@ -274,6 +306,9 @@ def build_demo() -> gr.Blocks:
             outputs=tz_state,
             js="() => Intl.DateTimeFormat().resolvedOptions().timeZone",
         )
+
+        if account_bar is not None:
+            demo.load(fn=_account_bar, inputs=None, outputs=account_bar)
 
         agent_input.submit(
             fn=handle_agent_submit,
