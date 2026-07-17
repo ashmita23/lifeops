@@ -22,6 +22,7 @@ existing approval gate (_requires_approval) still catches delete-event.
 import json
 import logging
 from datetime import datetime
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -187,6 +188,13 @@ def _start_end_obj(value: str, time_zone: str) -> dict:
     return {"dateTime": value, "timeZone": time_zone}
 
 
+def _pathsafe(value: str) -> str:
+    """URL-encode a calendarId/eventId for use in the REST path. Calendar IDs
+    like the US-holidays calendar contain '#'/'@' which otherwise break the URL
+    (404), so secondary/shared calendars would silently fail without this."""
+    return quote(str(value), safe="")
+
+
 def _dispatch(name: str, args: dict, token: str) -> dict:
     """Execute one calendar op against Google's REST API. Returns the JSON the
     model should read. Raises httpx.HTTPStatusError on API failure."""
@@ -205,7 +213,7 @@ def _dispatch(name: str, args: dict, token: str) -> dict:
             return {"calendars": [{"id": c["id"], "summary": c.get("summary")} for c in items]}
 
         if name in ("list-events", "search-events"):
-            cal = args["calendarId"]
+            cal = _pathsafe(args["calendarId"])
             params = {"singleEvents": "true", "orderBy": "startTime", "timeZone": tz}
             for k in ("timeMin", "timeMax"):
                 if args.get(k):
@@ -219,20 +227,23 @@ def _dispatch(name: str, args: dict, token: str) -> dict:
 
         if name == "create-event":
             body = _event_body(args, tz)
-            r = client.post(f"{_API}/calendars/{args['calendarId']}/events", json=body)
+            r = client.post(f"{_API}/calendars/{_pathsafe(args['calendarId'])}/events", json=body)
             r.raise_for_status()
             return {"event": _slim_event(r.json())}
 
         if name == "update-event":
             body = _event_body(args, tz, partial=True)
             r = client.patch(
-                f"{_API}/calendars/{args['calendarId']}/events/{args['eventId']}", json=body
+                f"{_API}/calendars/{_pathsafe(args['calendarId'])}/events/{_pathsafe(args['eventId'])}",
+                json=body,
             )
             r.raise_for_status()
             return {"event": _slim_event(r.json())}
 
         if name == "delete-event":
-            r = client.delete(f"{_API}/calendars/{args['calendarId']}/events/{args['eventId']}")
+            r = client.delete(
+                f"{_API}/calendars/{_pathsafe(args['calendarId'])}/events/{_pathsafe(args['eventId'])}"
+            )
             r.raise_for_status()
             return {"deleted": True, "eventId": args["eventId"]}
 
